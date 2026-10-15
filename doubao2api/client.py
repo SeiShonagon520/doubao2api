@@ -22,6 +22,7 @@ import aiohttp
 
 from .qr_login import CHROME_VERSION, CHROMIUM_BUILD
 from .sse import iter_sse_events
+from .browser_client import resolve_memory_type
 
 log = logging.getLogger(__name__)
 
@@ -1377,6 +1378,10 @@ class DoubaoChatClient:
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        ref_image_keys: Optional[List[str]] = None,
+        timeout: float = 120,
+        memory_type: Optional[int] = None,
+        save_history: Optional[bool] = None,
     ) -> "ImageGenerationResult":
         """Generate images using Doubao's AI image generation.
 
@@ -1387,7 +1392,11 @@ class DoubaoChatClient:
             prompt: Text description of the image to generate.
             ratio: Aspect ratio string (e.g. "1:1", "16:9", "9:16", "4:3", "3:4").
                    If None, the server picks a default (usually 1:1).
-            ref_image_key: Optional image key (from upload_image) to use as reference.
+            ref_image_key: Optional image key (from upload_image) to use as reference (single image).
+            ref_image_keys: Optional list of image keys to use as reference (multi-image).
+            timeout: Max seconds to wait for generation.
+            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
+            save_history: If True, sets memory_type=0.
 
         Returns:
             ImageGenerationResult with list of generated images.
@@ -1405,9 +1414,19 @@ class DoubaoChatClient:
             },
         }
 
-        if ref_image_key:
+        keys = []
+        if ref_image_keys:
+            if isinstance(ref_image_keys, str):
+                keys.append(ref_image_keys)
+            elif isinstance(ref_image_keys, (list, tuple)):
+                keys.extend([k for k in ref_image_keys if k])
+        if ref_image_key and ref_image_key not in keys:
+            keys.insert(0, ref_image_key)
+
+        if keys:
             message["attachments"] = [
-                {"type": "image", "key": ref_image_key, "extra": {"refer_types": "overall"}}
+                {"type": "image", "key": k, "extra": {"refer_types": "overall"}}
+                for k in keys
             ]
 
         if ratio:
@@ -1415,6 +1434,7 @@ class DoubaoChatClient:
                 {"text": prompt, "ratio": ratio}, ensure_ascii=False
             )
 
+        eff_mem_type = resolve_memory_type(memory_type, save_history)
         sent_event: Dict[str, Any] = {
             "messages": [message],
             "completion_option": {
@@ -1425,7 +1445,7 @@ class DoubaoChatClient:
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
-                "memory_type": 2,
+                "memory_type": eff_mem_type,
                 "message_from": 0,
                 "use_deep_think": False,
                 "use_auto_cot": False,
@@ -1527,7 +1547,10 @@ class DoubaoChatClient:
         ratio: Optional[str] = None,
         camera_movement: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        ref_image_keys: Optional[List[str]] = None,
         timeout: float = 300,
+        memory_type: Optional[int] = None,
+        save_history: Optional[bool] = None,
     ) -> "VideoGenerationResult":
         """Generate video using Doubao's AI video generation.
 
@@ -1541,8 +1564,11 @@ class DoubaoChatClient:
             prompt: Text description of the video to generate.
             ratio: Aspect ratio (e.g. "16:9", "9:16", "1:1").
             camera_movement: Camera movement style (optional).
-            ref_image_key: Optional image key (from upload_image) for img2video.
+            ref_image_key: Optional image key (from upload_image) for img2video (single image).
+            ref_image_keys: Optional list of image keys for multi-image reference.
             timeout: Max seconds to wait for video generation (default 300).
+            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
+            save_history: If True, sets memory_type=0.
 
         Returns:
             VideoGenerationResult with list of generated videos.
@@ -1566,11 +1592,19 @@ class DoubaoChatClient:
             },
         }
 
-        if ref_image_key:
-            message["attachments"] = [
-                {"type": "image", "key": ref_image_key}
-            ]
+        keys = []
+        if ref_image_keys:
+            if isinstance(ref_image_keys, str):
+                keys.append(ref_image_keys)
+            elif isinstance(ref_image_keys, (list, tuple)):
+                keys.extend([k for k in ref_image_keys if k])
+        if ref_image_key and ref_image_key not in keys:
+            keys.insert(0, ref_image_key)
 
+        for k in keys:
+            message["attachments"].append({"type": "image", "key": k})
+
+        eff_mem_type = resolve_memory_type(memory_type, save_history)
         sent_event: Dict[str, Any] = {
             "messages": [message],
             "completion_option": {
@@ -1581,7 +1615,7 @@ class DoubaoChatClient:
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
-                "memory_type": 2,
+                "memory_type": eff_mem_type,
                 "message_from": 0,
                 "use_deep_think": False,
                 "use_auto_cot": False,
@@ -1819,6 +1853,9 @@ class DoubaoChatClient:
         gender: Optional[str] = None,
         theme: Optional[str] = None,
         generation_type: Optional[str] = None,
+        timeout: float = 300,
+        memory_type: Optional[int] = None,
+        save_history: Optional[bool] = None,
     ) -> "MusicGenerationResult":
         """Generate music using Doubao's AI music generation.
 
@@ -1833,6 +1870,9 @@ class DoubaoChatClient:
             gender: Vocalist gender preference (optional).
             theme: Theme of the song (optional).
             generation_type: Generation mode (optional).
+            timeout: Timeout in seconds.
+            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
+            save_history: If True, sets memory_type=0.
 
         Returns:
             MusicGenerationResult with list of generated tracks.
@@ -1864,6 +1904,7 @@ class DoubaoChatClient:
             },
         }
 
+        eff_mem_type = resolve_memory_type(memory_type, save_history)
         sent_event: Dict[str, Any] = {
             "messages": [message],
             "completion_option": {
@@ -1874,7 +1915,7 @@ class DoubaoChatClient:
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
-                "memory_type": 2,
+                "memory_type": eff_mem_type,
                 "message_from": 0,
                 "use_deep_think": False,
                 "use_auto_cot": False,

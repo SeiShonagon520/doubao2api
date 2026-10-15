@@ -74,6 +74,36 @@ def resolve_headless_mode(val: Optional[Union[bool, str]] = None) -> bool:
         return not has_display
 
 
+def resolve_memory_type(
+    memory_type: Optional[int] = None,
+    save_history: Optional[bool] = None,
+) -> int:
+    """
+    Resolve Doubao memory_type:
+    0 = normal conversation (saved to web history, not 阅后即焚)
+    2 = ephemeral / burn-after-reading (does NOT show in web chat history)
+
+    Priority:
+    1. Explicit memory_type argument (0 or 2)
+    2. save_history flag (True -> 0, False -> 2)
+    3. SAVE_CHAT_HISTORY / DOUBAO_AUTO_DELETE_CONV env vars:
+       - If SAVE_CHAT_HISTORY is true -> 0
+       - If DOUBAO_AUTO_DELETE_CONV is false/0/no -> 0
+       - Otherwise default to 2 (ephemeral)
+    """
+    if memory_type is not None:
+        return int(memory_type)
+    if save_history is not None:
+        return 0 if save_history else 2
+    save_env = os.environ.get("SAVE_CHAT_HISTORY", "").strip().lower()
+    if save_env in ("true", "1", "yes"):
+        return 0
+    auto_del_env = os.environ.get("DOUBAO_AUTO_DELETE_CONV", "true").strip().lower()
+    if auto_del_env in ("false", "0", "no"):
+        return 0
+    return 2
+
+
 def bring_window_to_foreground():
     """Attempt to bring the browser window to the foreground on Windows."""
     if os.name != "nt":
@@ -1575,13 +1605,19 @@ class BrowserClient:
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        ref_image_keys: Optional[List[str]] = None,
+        memory_type: Optional[int] = None,
+        save_history: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Generate images using /samantha/chat/completion.
 
         Args:
             prompt: Text description of the image to generate.
             ratio: Aspect ratio ("1:1", "16:9", "9:16", "4:3", "3:4").
-            ref_image_key: Optional uploaded image key for reference.
+            ref_image_key: Optional uploaded image key for reference (single image).
+            ref_image_keys: Optional list of uploaded image keys for reference (multi-image).
+            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
+            save_history: If True, sets memory_type=0.
 
         Returns:
             Dict with 'images' list, each having url/width/height/key.
@@ -1603,12 +1639,22 @@ class BrowserClient:
             },
         }
 
-        if ref_image_key:
+        keys = []
+        if ref_image_keys:
+            if isinstance(ref_image_keys, str):
+                keys.append(ref_image_keys)
+            elif isinstance(ref_image_keys, (list, tuple)):
+                keys.extend([k for k in ref_image_keys if k])
+        if ref_image_key and ref_image_key not in keys:
+            keys.insert(0, ref_image_key)
+
+        if keys:
             message["attachments"] = [
-                {"type": "image", "key": ref_image_key,
-                 "extra": {"refer_types": "overall"}}
+                {"type": "image", "key": k, "extra": {"refer_types": "overall"}}
+                for k in keys
             ]
 
+        eff_mem_type = resolve_memory_type(memory_type, save_history)
         payload = {
             "messages": [message],
             "completion_option": {
@@ -1619,7 +1665,7 @@ class BrowserClient:
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
-                "memory_type": 2,
+                "memory_type": eff_mem_type,
                 "message_from": 0,
                 "use_deep_think": False,
                 "use_auto_cot": False,
@@ -1693,6 +1739,8 @@ class BrowserClient:
         prompt: str,
         lyric: Optional[str] = None,
         genre: Optional[str] = None,
+        memory_type: Optional[int] = None,
+        save_history: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Generate music using /samantha/chat/completion.
 
@@ -1700,6 +1748,8 @@ class BrowserClient:
             prompt: Text description of the music to generate.
             lyric: Explicit lyrics (optional).
             genre: Music genre (optional).
+            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
+            save_history: If True, sets memory_type=0.
 
         Returns:
             Dict with 'tracks' list, each having audio_url/title/lyrics/duration.
@@ -1725,6 +1775,7 @@ class BrowserClient:
             },
         }
 
+        eff_mem_type = resolve_memory_type(memory_type, save_history)
         payload = {
             "messages": [message],
             "completion_option": {
@@ -1735,7 +1786,7 @@ class BrowserClient:
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
-                "memory_type": 2,
+                "memory_type": eff_mem_type,
                 "message_from": 0,
                 "use_deep_think": False,
                 "use_auto_cot": False,
@@ -1849,13 +1900,19 @@ class BrowserClient:
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        ref_image_keys: Optional[List[str]] = None,
+        memory_type: Optional[int] = None,
+        save_history: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Generate video using /samantha/chat/completion (async 2-step).
 
         Args:
             prompt: Text description of the video to generate.
             ratio: Aspect ratio ("16:9", "9:16", "1:1").
-            ref_image_key: Optional image key for image-to-video (img2video).
+            ref_image_key: Optional image key for image-to-video (single image).
+            ref_image_keys: Optional list of image keys for multi-image reference.
+            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
+            save_history: If True, sets memory_type=0.
 
         Returns:
             Dict with 'videos' list, each having video_url/cover_url/duration.
@@ -1866,9 +1923,17 @@ class BrowserClient:
         if ratio:
             content_data["ratio"] = ratio
 
-        attachments = []
-        if ref_image_key:
-            attachments.append({"type": "image", "key": ref_image_key})
+        # Support both single and multiple reference images
+        keys = []
+        if ref_image_keys:
+            if isinstance(ref_image_keys, str):
+                keys.append(ref_image_keys)
+            elif isinstance(ref_image_keys, (list, tuple)):
+                keys.extend([k for k in ref_image_keys if k])
+        if ref_image_key and ref_image_key not in keys:
+            keys.insert(0, ref_image_key)
+
+        attachments = [{"type": "image", "key": k} for k in keys]
 
         message: Dict[str, Any] = {
             "content": json.dumps(content_data, ensure_ascii=False),
@@ -1883,6 +1948,7 @@ class BrowserClient:
             },
         }
 
+        eff_mem_type = resolve_memory_type(memory_type, save_history)
         payload = {
             "messages": [message],
             "completion_option": {
@@ -1893,7 +1959,7 @@ class BrowserClient:
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
-                "memory_type": 2,
+                "memory_type": eff_mem_type,
                 "message_from": 0,
                 "use_deep_think": False,
                 "use_auto_cot": False,
@@ -1906,7 +1972,7 @@ class BrowserClient:
             "local_message_id": str(uuid.uuid4()),
         }
 
-        log.info("generate_video: prompt=%s, ratio=%s", prompt[:50], ratio)
+        log.info("generate_video: prompt=%s, ratio=%s, memory_type=%s, attachments_count=%d", prompt[:50], ratio, eff_mem_type, len(attachments))
         raw = await self._samantha_request(payload, timeout=60)
 
         # Phase 1: Extract async task_id from fin_reason
@@ -1924,7 +1990,14 @@ class BrowserClient:
                         if next_acc:
                             log.info("Video quota error 2005. Auto-switching to account %s (%s)...", next_acc.id, next_acc.name)
                             if await self.switch_to_account(next_acc.id):
-                                return await self.generate_video(prompt=prompt, ratio=ratio, ref_image_key=ref_image_key)
+                                return await self.generate_video(
+                                    prompt=prompt,
+                                    ratio=ratio,
+                                    ref_image_key=ref_image_key,
+                                    ref_image_keys=ref_image_keys,
+                                    memory_type=memory_type,
+                                    save_history=save_history,
+                                )
                 raise RuntimeError(f"generate_video error: {str(detail)[:500]}")
             if et != 2001:
                 continue

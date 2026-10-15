@@ -771,11 +771,17 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
             <div class="text-slate-400 mb-1">每分钟请求限制 (RPM)</div>
             <div class="text-sm font-semibold font-mono text-emerald-400">{{serverInfo.rpm_limit || 20}} 次/分</div>
           </div>
-          <div class="p-3.5 bg-surface-900/60 rounded-xl border border-slate-800">
-            <div class="text-slate-400 mb-1">即用即焚模式 (自动删除临时对话)</div>
-            <div class="text-sm font-semibold font-mono" :class="serverInfo.auto_delete_conv?'text-emerald-400':'text-amber-400'">
-              {{serverInfo.auto_delete_conv ? '已开启 (推荐)' : '已关闭'}}
+          <div class="p-3.5 bg-surface-900/60 rounded-xl border border-slate-800 flex justify-between items-center">
+            <div>
+              <div class="text-slate-400 mb-1">会话留存模式 (即用即焚 / 网页端历史)</div>
+              <div class="text-sm font-semibold font-mono" :class="serverInfo.auto_delete_conv?'text-emerald-400':'text-amber-400'">
+                {{serverInfo.auto_delete_conv ? '已开启即焚 (临时对话，不污染网页)' : '已关闭即焚 (生图/视频同步保存至网页端)'}}
+              </div>
             </div>
+            <button @click="toggleAutoDelete" class="px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer"
+              :class="serverInfo.auto_delete_conv ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 hover:bg-amber-500/30' : 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/30'">
+              {{serverInfo.auto_delete_conv ? '切换为：留存网页' : '切换为：即用即焚'}}
+            </button>
           </div>
         </div>
 
@@ -1461,6 +1467,15 @@ createApp({
       }
     }
 
+    async function toggleAutoDelete(){
+      try{
+        const r = await api('/admin/api/config/auto-delete', { method: 'POST' });
+        serverInfo.value.auto_delete_conv = r.auto_delete_conv;
+      }catch(e){
+        alert('切换失败: ' + e.message);
+      }
+    }
+
     async function fetchLogs(){
       try{
         const l = await api('/admin/api/logs');
@@ -1600,7 +1615,7 @@ createApp({
       logs, test,
       fetchOverview, fetchSystem, openDoubaoWeb, toggleBrowserMode, forceWindow,
       toggleScreenshot, refreshScreenshot, submitCookie, fetchLogs, runTest, resetCaptcha,
-      installChromium, installingChromium,
+      installChromium, installingChromium, toggleAutoDelete,
       // Multi-account pool
       accounts, accountStrategy, activeAccountId, accountActionLoading,
       showAddAccountModal, newAccount, newAccountLoading, newAccountError,

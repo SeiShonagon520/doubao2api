@@ -313,9 +313,14 @@ class ImageGenerationRequest(BaseModel):
     size: Optional[str] = "1024x1024"
     ratio: Optional[str] = None
     ref_image_key: Optional[str] = None
+    ref_image_keys: Optional[List[str]] = None
     image: Optional[Any] = None
+    images: Optional[List[Any]] = None
     image_url: Optional[Any] = None
+    image_urls: Optional[List[str]] = None
     response_format: Optional[str] = "url"
+    save_history: Optional[bool] = None
+    memory_type: Optional[int] = None
 
 # ── Application factory ──────────────────────────────────────
 
@@ -695,6 +700,25 @@ def create_app(
 
         raise HTTPException(status_code=400, detail=f"Unsupported image format: {image_str[:80]}")
 
+    async def _resolve_multi_images_to_keys(client: Any, image_inputs: List[Any]) -> List[str]:
+        """Resolve a list of image inputs (files, TOS keys, Data URIs, URLs, or dicts) to TOS keys."""
+        keys = []
+        for item in image_inputs:
+            if not item:
+                continue
+            if hasattr(item, "read"):
+                file_bytes = await item.read()
+                filename = getattr(item, "filename", "ref_image.png") or "ref_image.png"
+                uploaded = await client.upload_image(image_bytes=file_bytes, filename=filename)
+                key = uploaded.get("uri", "")
+                if key and key not in keys:
+                    keys.append(key)
+            elif isinstance(item, (str, dict)):
+                key = await _resolve_image_to_key(client, item)
+                if key and key not in keys:
+                    keys.append(key)
+        return keys
+
     # ── Request logging middleware ──
 
     @app.middleware("http")
@@ -1004,15 +1028,48 @@ def create_app(
         await _resolve_captcha_or_failover(client)
 
         ratio = body.ratio or _size_to_ratio(body.size)
-        ref_image_key = body.ref_image_key
-        if not ref_image_key and (body.image or body.image_url):
-            ref_image_key = await _resolve_image_to_key(client, body.image or body.image_url)
+        ref_image_keys = []
+        if body.ref_image_keys:
+            ref_image_keys.extend([str(k).strip() for k in body.ref_image_keys if str(k).strip()])
+        if body.ref_image_key and body.ref_image_key not in ref_image_keys:
+            ref_image_keys.insert(0, body.ref_image_key)
+
+        img_inputs = []
+        for val in (body.images, body.image_urls, body.image, body.image_url):
+            if isinstance(val, list):
+                img_inputs.extend(val)
+            elif val:
+                img_inputs.append(val)
+
+        if img_inputs:
+            uploaded_keys = await _resolve_multi_images_to_keys(client, img_inputs)
+            for uk in uploaded_keys:
+                if uk not in ref_image_keys:
+                    ref_image_keys.append(uk)
+
+        ref_image_key = ref_image_keys[0] if ref_image_keys else None
+
+        gen_kwargs = {}
+        if len(ref_image_keys) > 1:
+            gen_kwargs["ref_image_keys"] = ref_image_keys
+
+        header_save = request.headers.get("x-save-history", "").lower() in ("true", "1", "yes")
+        header_no_del = request.headers.get("x-auto-delete", "").lower() in ("false", "0", "no")
+        if body.memory_type is not None:
+            gen_kwargs["memory_type"] = body.memory_type
+        elif body.save_history is not None:
+            gen_kwargs["save_history"] = body.save_history
+        elif header_save or header_no_del:
+            gen_kwargs["save_history"] = True
+        elif not _auto_delete_conv:
+            gen_kwargs["memory_type"] = 0
 
         try:
             result = await client.generate_image(
                 prompt=body.prompt,
                 ratio=ratio,
                 ref_image_key=ref_image_key,
+                **gen_kwargs,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1050,43 +1107,104 @@ def create_app(
         ratio = None
         ref_image_key = None
 
+        save_history = None
+        memory_type = None
+
+        ref_image_keys = []
         if "multipart/form-data" in content_type:
             form = await request.form()
             prompt = str(form.get("prompt", "")).strip()
             size = form.get("size") or "1024x1024"
             ratio = form.get("ratio")
-            ref_image_key = form.get("ref_image_key")
-            file_field = form.get("image")
-            if not ref_image_key and file_field:
-                if hasattr(file_field, "read"):
-                    file_bytes = await file_field.read()
-                    filename = getattr(file_field, "filename", "ref_image.png") or "ref_image.png"
-                    uploaded = await client.upload_image(image_bytes=file_bytes, filename=filename)
-                    ref_image_key = uploaded.get("uri", "")
-                elif isinstance(file_field, str):
-                    ref_image_key = await _resolve_image_to_key(client, file_field)
+            raw_keys = form.getlist("ref_image_keys") or form.getlist("ref_image_key")
+            for rk in raw_keys:
+                if isinstance(rk, str):
+                    for k in rk.split(","):
+                        k = k.strip()
+                        if k and k not in ref_image_keys:
+                            ref_image_keys.append(k)
+            if form.get("save_history") is not None:
+                save_history = str(form.get("save_history")).lower() in ("true", "1", "yes")
+            if form.get("memory_type") is not None:
+                try:
+                    memory_type = int(form.get("memory_type"))
+                except ValueError:
+                    pass
+            file_items = []
+            for field_name in ("images", "image", "files", "file"):
+                for it in form.getlist(field_name):
+                    if it and it not in file_items:
+                        file_items.append(it)
+            if file_items:
+                uploaded_keys = await _resolve_multi_images_to_keys(client, file_items)
+                for uk in uploaded_keys:
+                    if uk not in ref_image_keys:
+                        ref_image_keys.append(uk)
         else:
             body = await request.json()
             prompt = str(body.get("prompt", "")).strip()
             size = body.get("size") or "1024x1024"
             ratio = body.get("ratio")
-            ref_image_key = body.get("ref_image_key")
-            image_input = body.get("image") or body.get("image_url")
-            if not ref_image_key and image_input:
-                ref_image_key = await _resolve_image_to_key(client, image_input)
+            raw_keys = body.get("ref_image_keys") or body.get("ref_image_key")
+            if isinstance(raw_keys, str):
+                for k in raw_keys.split(","):
+                    k = k.strip()
+                    if k and k not in ref_image_keys:
+                        ref_image_keys.append(k)
+            elif isinstance(raw_keys, list):
+                for k in raw_keys:
+                    k = str(k).strip()
+                    if k and k not in ref_image_keys:
+                        ref_image_keys.append(k)
+            if body.get("save_history") is not None:
+                save_history = bool(body.get("save_history"))
+            if body.get("memory_type") is not None:
+                try:
+                    memory_type = int(body.get("memory_type"))
+                except ValueError:
+                    pass
+            img_items = []
+            for field_name in ("images", "image_urls", "ref_images", "image", "image_url", "ref_image"):
+                val = body.get(field_name)
+                if isinstance(val, list):
+                    img_items.extend(val)
+                elif val:
+                    img_items.append(val)
+            if img_items:
+                uploaded_keys = await _resolve_multi_images_to_keys(client, img_items)
+                for uk in uploaded_keys:
+                    if uk not in ref_image_keys:
+                        ref_image_keys.append(uk)
 
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
-        if not ref_image_key:
+        if not ref_image_keys:
             raise HTTPException(status_code=400, detail="Missing reference image (image or ref_image_key)")
 
         actual_ratio = ratio or _size_to_ratio(size)
+        ref_image_key = ref_image_keys[0]
+
+        gen_kwargs = {}
+        if len(ref_image_keys) > 1:
+            gen_kwargs["ref_image_keys"] = ref_image_keys
+
+        header_save = request.headers.get("x-save-history", "").lower() in ("true", "1", "yes")
+        header_no_del = request.headers.get("x-auto-delete", "").lower() in ("false", "0", "no")
+        if memory_type is not None:
+            gen_kwargs["memory_type"] = memory_type
+        elif save_history is not None:
+            gen_kwargs["save_history"] = save_history
+        elif header_save or header_no_del:
+            gen_kwargs["save_history"] = True
+        elif not _auto_delete_conv:
+            gen_kwargs["memory_type"] = 0
 
         try:
             result = await client.generate_image(
                 prompt=prompt,
                 ratio=actual_ratio,
                 ref_image_key=ref_image_key,
+                **gen_kwargs,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1120,11 +1238,26 @@ def create_app(
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
 
+        save_history = body.get("save_history")
+        memory_type = body.get("memory_type")
+        gen_kwargs = {}
+        header_save = request.headers.get("x-save-history", "").lower() in ("true", "1", "yes")
+        header_no_del = request.headers.get("x-auto-delete", "").lower() in ("false", "0", "no")
+        if memory_type is not None:
+            gen_kwargs["memory_type"] = memory_type
+        elif save_history is not None:
+            gen_kwargs["save_history"] = save_history
+        elif header_save or header_no_del:
+            gen_kwargs["save_history"] = True
+        elif not _auto_delete_conv:
+            gen_kwargs["memory_type"] = 0
+
         try:
             result = await client.generate_music(
                 prompt=prompt,
                 lyric=body.get("lyric"),
                 genre=body.get("genre"),
+                **gen_kwargs,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1152,28 +1285,72 @@ def create_app(
         ratio = None
         ref_image_key = None
 
+        save_history = None
+        memory_type = None
+
+        ref_image_keys = []
         if "multipart/form-data" in content_type:
             form = await request.form()
             prompt = str(form.get("prompt", "")).strip()
             ratio = form.get("ratio") or form.get("size")
-            ref_image_key = form.get("ref_image_key")
-            file_field = form.get("image") or form.get("file")
-            if not ref_image_key and file_field:
-                if hasattr(file_field, "read"):
-                    file_bytes = await file_field.read()
-                    filename = getattr(file_field, "filename", "ref_image.png") or "ref_image.png"
-                    uploaded = await client.upload_image(image_bytes=file_bytes, filename=filename)
-                    ref_image_key = uploaded.get("uri", "")
-                elif isinstance(file_field, str):
-                    ref_image_key = await _resolve_image_to_key(client, file_field)
+            raw_keys = form.getlist("ref_image_keys") or form.getlist("ref_image_key")
+            for rk in raw_keys:
+                if isinstance(rk, str):
+                    for k in rk.split(","):
+                        k = k.strip()
+                        if k and k not in ref_image_keys:
+                            ref_image_keys.append(k)
+            if form.get("save_history") is not None:
+                save_history = str(form.get("save_history")).lower() in ("true", "1", "yes")
+            if form.get("memory_type") is not None:
+                try:
+                    memory_type = int(form.get("memory_type"))
+                except ValueError:
+                    pass
+            file_items = []
+            for field_name in ("images", "image", "files", "file"):
+                for it in form.getlist(field_name):
+                    if it and it not in file_items:
+                        file_items.append(it)
+            if file_items:
+                uploaded_keys = await _resolve_multi_images_to_keys(client, file_items)
+                for uk in uploaded_keys:
+                    if uk not in ref_image_keys:
+                        ref_image_keys.append(uk)
         else:
             body = await request.json()
             prompt = str(body.get("prompt", "")).strip()
             ratio = body.get("ratio") or body.get("size")
-            ref_image_key = body.get("ref_image_key")
-            image_input = body.get("image") or body.get("image_url") or body.get("ref_image")
-            if not ref_image_key and image_input:
-                ref_image_key = await _resolve_image_to_key(client, image_input)
+            raw_keys = body.get("ref_image_keys") or body.get("ref_image_key")
+            if isinstance(raw_keys, str):
+                for k in raw_keys.split(","):
+                    k = k.strip()
+                    if k and k not in ref_image_keys:
+                        ref_image_keys.append(k)
+            elif isinstance(raw_keys, list):
+                for k in raw_keys:
+                    k = str(k).strip()
+                    if k and k not in ref_image_keys:
+                        ref_image_keys.append(k)
+            if body.get("save_history") is not None:
+                save_history = bool(body.get("save_history"))
+            if body.get("memory_type") is not None:
+                try:
+                    memory_type = int(body.get("memory_type"))
+                except ValueError:
+                    pass
+            img_items = []
+            for field_name in ("images", "image_urls", "ref_images", "image", "image_url", "ref_image"):
+                val = body.get(field_name)
+                if isinstance(val, list):
+                    img_items.extend(val)
+                elif val:
+                    img_items.append(val)
+            if img_items:
+                uploaded_keys = await _resolve_multi_images_to_keys(client, img_items)
+                for uk in uploaded_keys:
+                    if uk not in ref_image_keys:
+                        ref_image_keys.append(uk)
 
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
@@ -1181,9 +1358,26 @@ def create_app(
         if ratio and "x" in str(ratio):
             ratio = _size_to_ratio(ratio)
 
+        ref_image_key = ref_image_keys[0] if ref_image_keys else None
+
+        gen_kwargs = {}
+        if len(ref_image_keys) > 1:
+            gen_kwargs["ref_image_keys"] = ref_image_keys
+
+        header_save = request.headers.get("x-save-history", "").lower() in ("true", "1", "yes")
+        header_no_del = request.headers.get("x-auto-delete", "").lower() in ("false", "0", "no")
+        if memory_type is not None:
+            gen_kwargs["memory_type"] = memory_type
+        elif save_history is not None:
+            gen_kwargs["save_history"] = save_history
+        elif header_save or header_no_del:
+            gen_kwargs["save_history"] = True
+        elif not _auto_delete_conv:
+            gen_kwargs["memory_type"] = 0
+
         try:
             result = await client.generate_video(
-                prompt=prompt, ratio=ratio, ref_image_key=ref_image_key,
+                prompt=prompt, ratio=ratio, ref_image_key=ref_image_key, **gen_kwargs
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
@@ -1888,6 +2082,23 @@ def create_app(
             },
             "auto_delete_conv": _auto_delete_conv,
         })
+
+    @app.post("/admin/api/config/auto-delete")
+    async def admin_toggle_auto_delete(request: Request):
+        """Toggle or set auto_delete_conv mode (即用即焚 / 阅后即焚) at runtime."""
+        _check_auth(request)
+        global _auto_delete_conv
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if "enabled" in body:
+            _auto_delete_conv = bool(body["enabled"])
+        else:
+            _auto_delete_conv = not _auto_delete_conv
+        os.environ["DOUBAO_AUTO_DELETE_CONV"] = "true" if _auto_delete_conv else "false"
+        log.info("Runtime auto_delete_conv toggled to: %s", _auto_delete_conv)
+        return JSONResponse({"status": "ok", "auto_delete_conv": _auto_delete_conv})
 
     @app.get("/admin/api/logs")
     async def admin_logs(request: Request):
