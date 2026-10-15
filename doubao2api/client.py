@@ -906,8 +906,8 @@ class DoubaoChatClient:
                                 "uri": img["uri"],
                                 "image_ori": {
                                     "url": img["cdn_url"],
-                                    "width": int(img.get("width", 64)),
-                                    "height": int(img.get("height", 64)),
+                                    "width": int(img.get("width", 1024)),
+                                    "height": int(img.get("height", 1024)),
                                     "format": img.get("format", "png"),
                                     "url_formats": {},
                                 },
@@ -2293,15 +2293,25 @@ class DoubaoChatClient:
             file_urls = data.get("file_urls", []) if isinstance(data, dict) else []
             if not file_urls:
                 raise DoubaoChatError("get_file_url returned no file_urls")
-            file_info = file_urls[0]
+        img_w = 1024
+        img_h = 1024
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(image_bytes)) as pil_img:
+                img_w, img_h = pil_img.size
+                if pil_img.format:
+                    ext = pil_img.format.lower()
+        except Exception:
+            pass
 
         return {
             "uri": file_info["uri"],
-            "cdn_url": file_info["main_url"],
+            "cdn_url": file_info.get("main_url") or file_info.get("url", ""),
             "name": filename,
             "format": ext,
-            "width": "64",
-            "height": "64",
+            "width": int(file_info.get("width") or img_w),
+            "height": int(file_info.get("height") or img_h),
         }
 
     async def get_file_download_url(

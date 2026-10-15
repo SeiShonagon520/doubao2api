@@ -1073,6 +1073,8 @@ class BrowserClient:
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
         use_deep_think: int = 0,
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
+        file_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
         if not self._page or self._page.is_closed() or not await self.is_alive():
@@ -1089,6 +1091,88 @@ class BrowserClient:
         now_ms = int(time.time() * 1000)
         now_sec = int(time.time())
 
+        content_blocks: List[Dict[str, Any]] = []
+
+        # 1. File attachments (type=3)
+        if file_attachments:
+            att_list = []
+            for f in file_attachments:
+                att_list.append({
+                    "type": 3,
+                    "identifier": str(uuid.uuid4()),
+                    "file": {
+                        "uri": f.get("uri", ""),
+                        "url": "",
+                        "file_type": 0,
+                        "name": f.get("name", "file.txt"),
+                        "size": int(f.get("size") or 0),
+                    },
+                    "parse_state": 1,
+                    "review_state": 1,
+                    "upload_status": 1,
+                    "progress": 100,
+                    "src": "",
+                })
+            content_blocks.append({
+                "block_type": 10052,
+                "content": {
+                    "attachment_block": {"attachments": att_list},
+                    "pc_event_block": "",
+                },
+                "block_id": str(uuid.uuid4()),
+                "parent_id": "",
+                "meta_info": [],
+                "append_fields": [],
+            })
+
+        # 2. Image attachments (type=1) with genuine dimensions
+        if image_attachments:
+            for img in image_attachments:
+                content_blocks.append({
+                    "block_type": 10052,
+                    "content": {
+                        "attachment_block": {
+                            "attachments": [{
+                                "type": 1,
+                                "identifier": str(uuid.uuid4()),
+                                "image": {
+                                    "name": img.get("name", "image.png"),
+                                    "uri": img.get("uri", ""),
+                                    "image_ori": {
+                                        "url": img.get("cdn_url", ""),
+                                        "width": int(img.get("width") or 1024),
+                                        "height": int(img.get("height") or 1024),
+                                        "format": img.get("format", "png"),
+                                        "url_formats": {},
+                                    },
+                                },
+                                "parse_state": 0,
+                                "review_state": 0,
+                            }],
+                        },
+                        "pc_event_block": "",
+                    },
+                    "block_id": str(uuid.uuid4()),
+                    "parent_id": "",
+                    "meta_info": [],
+                    "append_fields": [],
+                    "is_finish": True,
+                    "patch_type": 2,
+                })
+
+        # 3. Text block (block_type 10000)
+        content_blocks.append({
+            "block_type": 10000,
+            "content": {
+                "text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
+                "pc_event_block": "",
+            },
+            "block_id": str(uuid.uuid4()),
+            "parent_id": "",
+            "meta_info": [],
+            "append_fields": [],
+        })
+
         payload = {
             "client_meta": {
                 "local_conversation_id": local_conv_id if need_create else "",
@@ -1104,17 +1188,7 @@ class BrowserClient:
             },
             "messages": [{
                 "local_message_id": msg_uuid,
-                "content_block": [{
-                    "block_type": 10000,
-                    "content": {
-                        "text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
-                        "pc_event_block": "",
-                    },
-                    "block_id": str(uuid.uuid4()),
-                    "parent_id": "",
-                    "meta_info": [],
-                    "append_fields": [],
-                }],
+                "content_block": content_blocks,
                 "message_status": 0,
             }],
             "option": {
@@ -2368,13 +2442,25 @@ class BrowserClient:
         if not file_urls:
             raise RuntimeError("get_file_url returned no file_urls")
         info = file_urls[0]
+        img_w = 1024
+        img_h = 1024
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(image_bytes)) as pil_img:
+                img_w, img_h = pil_img.size
+                if pil_img.format:
+                    ext = pil_img.format.lower()
+        except Exception:
+            pass
+
         return {
             "uri": info.get("uri", uri),
-            "cdn_url": info.get("main_url", ""),
+            "cdn_url": info.get("main_url") or info.get("url", ""),
             "name": filename,
             "format": ext,
-            "width": "64",
-            "height": "64",
+            "width": int(info.get("width") or img_w),
+            "height": int(info.get("height") or img_h),
         }
 
     async def chat_with_file(
@@ -2389,7 +2475,7 @@ class BrowserClient:
 
         Args:
             text: Question about the file.
-            file_uri: URI from upload_file().
+            file_uri: URI from upload_file() or upload_image().
             file_name: Original filename.
             file_size: File size in bytes.
             use_deep_think: 0=quick, 1=think, 3=expert.
@@ -2409,24 +2495,94 @@ class BrowserClient:
             file_refs = file_uri
         else:
             file_refs = [{"uri": file_uri, "name": file_name, "size": file_size}]
+
+        content_blocks: List[Dict[str, Any]] = []
         file_attachments = []
+        image_attachments = []
         for file_ref in file_refs:
-            file_attachments.append({
-                "type": 3,
-                "identifier": str(uuid.uuid4()),
-                "file": {
-                    "uri": file_ref.get("uri", ""),
-                    "url": "",
-                    "file_type": 0,
-                    "name": file_ref.get("name", "file.txt"),
-                    "size": int(file_ref.get("size") or 0),
+            fname = file_ref.get("name", "").lower()
+            fext = fname.rsplit(".", 1)[-1] if "." in fname else ""
+            is_img = fext in ("png", "jpg", "jpeg", "webp", "gif", "bmp") or file_ref.get("is_image")
+            if is_img:
+                image_attachments.append(file_ref)
+            else:
+                file_attachments.append({
+                    "type": 3,
+                    "identifier": str(uuid.uuid4()),
+                    "file": {
+                        "uri": file_ref.get("uri", ""),
+                        "url": "",
+                        "file_type": 0,
+                        "name": file_ref.get("name", "file.txt"),
+                        "size": int(file_ref.get("size") or 0),
+                    },
+                    "parse_state": 1,
+                    "review_state": 1,
+                    "upload_status": 1,
+                    "progress": 100,
+                    "src": "",
+                })
+
+        if file_attachments:
+            content_blocks.append({
+                "block_type": 10052,
+                "content": {
+                    "attachment_block": {
+                        "attachments": file_attachments
+                    },
+                    "pc_event_block": "",
                 },
-                "parse_state": 1,
-                "review_state": 1,
-                "upload_status": 1,
-                "progress": 100,
-                "src": "",
+                "block_id": str(uuid.uuid4()),
+                "parent_id": "",
+                "meta_info": [],
+                "append_fields": [],
             })
+
+        if image_attachments:
+            for img in image_attachments:
+                content_blocks.append({
+                    "block_type": 10052,
+                    "content": {
+                        "attachment_block": {
+                            "attachments": [{
+                                "type": 1,
+                                "identifier": str(uuid.uuid4()),
+                                "image": {
+                                    "name": img.get("name", "image.png"),
+                                    "uri": img.get("uri", ""),
+                                    "image_ori": {
+                                        "url": img.get("cdn_url", ""),
+                                        "width": int(img.get("width") or 1024),
+                                        "height": int(img.get("height") or 1024),
+                                        "format": img.get("format", "png"),
+                                        "url_formats": {},
+                                    },
+                                },
+                                "parse_state": 0,
+                                "review_state": 0,
+                            }],
+                        },
+                        "pc_event_block": "",
+                    },
+                    "block_id": str(uuid.uuid4()),
+                    "parent_id": "",
+                    "meta_info": [],
+                    "append_fields": [],
+                    "is_finish": True,
+                    "patch_type": 2,
+                })
+
+        content_blocks.append({
+            "block_type": 10000,
+            "content": {
+                "text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
+                "pc_event_block": "",
+            },
+            "block_id": str(uuid.uuid4()),
+            "parent_id": "",
+            "meta_info": [],
+            "append_fields": [],
+        })
 
         payload = {
             "client_meta": {
@@ -2438,32 +2594,7 @@ class BrowserClient:
             },
             "messages": [{
                 "local_message_id": msg_uuid,
-                "content_block": [
-                    {
-                        "block_type": 10052,
-                        "content": {
-                            "attachment_block": {
-                                "attachments": file_attachments
-                            },
-                            "pc_event_block": "",
-                        },
-                        "block_id": str(uuid.uuid4()),
-                        "parent_id": "",
-                        "meta_info": [],
-                        "append_fields": [],
-                    },
-                    {
-                        "block_type": 10000,
-                        "content": {
-                            "text_block": {"text": text, "icon_url": "", "icon_url_dark": "", "summary": ""},
-                            "pc_event_block": "",
-                        },
-                        "block_id": str(uuid.uuid4()),
-                        "parent_id": "",
-                        "meta_info": [],
-                        "append_fields": [],
-                    },
-                ],
+                "content_block": content_blocks,
                 "message_status": 0,
             }],
             "option": {

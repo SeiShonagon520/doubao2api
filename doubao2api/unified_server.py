@@ -322,6 +322,50 @@ class ImageGenerationRequest(BaseModel):
     save_history: Optional[bool] = None
     memory_type: Optional[int] = None
 
+def _extract_prompt_and_file_refs(messages: List[_Message]) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract text prompt, OpenAI-style file_url references, and image_url references."""
+    parts: list[str] = []
+    file_refs: list[dict[str, Any]] = []
+    image_refs: list[dict[str, Any]] = []
+    for msg in messages:
+        if isinstance(msg.content, str):
+            if len(messages) == 1:
+                parts.append(msg.content)
+            else:
+                parts.append(f"[{msg.role}]: {msg.content}")
+            continue
+        if not isinstance(msg.content, list):
+            continue
+        for part in msg.content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type == "text":
+                text = part.get("text", "")
+                if text:
+                    if len(messages) == 1:
+                        parts.append(text)
+                    else:
+                        parts.append(f"[{msg.role}]: {text}")
+            elif part_type == "image_url":
+                img_data = part.get("image_url", {})
+                if isinstance(img_data, str):
+                    image_refs.append({"url": img_data})
+                elif isinstance(img_data, dict):
+                    image_refs.append(img_data)
+            elif part_type == "file_url":
+                file_url = part.get("file_url", {})
+                ref = {"url": file_url} if isinstance(file_url, str) else dict(file_url)
+                url_str = str(ref.get("url", "")).lower()
+                name_str = str(ref.get("name", "")).lower()
+                is_img = any(ext in url_str or ext in name_str for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", "image/"))
+                if is_img:
+                    image_refs.append(ref)
+                else:
+                    file_refs.append(ref)
+    return "\n".join(parts), file_refs, image_refs
+
+
 # ── Application factory ──────────────────────────────────────
 
 
@@ -512,43 +556,76 @@ def create_app(
                                 parts.append(f"[{msg.role}]: {text}")
         return "\n".join(parts)
 
-    def _extract_prompt_and_file_refs(messages: List[_Message]) -> tuple[str, list[dict[str, Any]]]:
-        """Extract text prompt and OpenAI-style file_url references."""
-        parts: list[str] = []
-        file_refs: list[dict[str, Any]] = []
-        for msg in messages:
-            if isinstance(msg.content, str):
-                if len(messages) == 1:
-                    parts.append(msg.content)
-                else:
-                    parts.append(f"[{msg.role}]: {msg.content}")
+    async def _materialize_image_refs(client: BrowserClient, image_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Resolve image references (data URI, remote URL, TOS URI) to uploaded image metadata."""
+        import base64
+        import mimetypes
+        from urllib.parse import urlparse
+        images: list[dict[str, Any]] = []
+        for img_ref in image_refs:
+            url = str(img_ref.get("url", "")).strip()
+            if not url:
                 continue
-            if not isinstance(msg.content, list):
+            name = img_ref.get("name") or "image.png"
+            if url.startswith("tos-"):
+                images.append({
+                    "uri": url,
+                    "cdn_url": "",
+                    "name": name,
+                    "width": int(img_ref.get("width") or 1024),
+                    "height": int(img_ref.get("height") or 1024),
+                })
                 continue
-            for part in msg.content:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "text":
-                    text = part.get("text", "")
-                    if text:
-                        if len(messages) == 1:
-                            parts.append(text)
-                        else:
-                            parts.append(f"[{msg.role}]: {text}")
-                elif part.get("type") == "file_url":
-                    file_url = part.get("file_url", {})
-                    if isinstance(file_url, str):
-                        file_refs.append({"url": file_url})
-                    elif isinstance(file_url, dict):
-                        file_refs.append(file_url)
-        return "\n".join(parts), file_refs
+            img_bytes = None
+            if url.startswith("data:"):
+                try:
+                    header, encoded = url.split(",", 1)
+                    img_bytes = base64.b64decode(encoded)
+                except (ValueError, TypeError) as exc:
+                    raise HTTPException(status_code=400, detail=f"Invalid base64 in image_url: {exc}")
+                if name == "image.png" and ";" in header:
+                    mime_type = header[5:].split(";", 1)[0]
+                    ext = mimetypes.guess_extension(mime_type) or ".png"
+                    name = f"image{ext}"
+            elif url.startswith("http://") or url.startswith("https://"):
+                if not is_safe_url(url):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Prohibited or unsafe URL for image_url (SSRF protection): {url[:80]}",
+                    )
+                parsed = urlparse(url)
+                inferred_name = parsed.path.rsplit("/", 1)[-1] or "image.png"
+                if "." not in inferred_name:
+                    inferred_name += ".png"
+                name = inferred_name
+                try:
+                    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as http_client:
+                        resp = await http_client.get(url)
+                        if resp.status_code != 200:
+                            raise HTTPException(
+                                status_code=502,
+                                detail=f"Failed to fetch remote image from {url[:80]} (status {resp.status_code})",
+                            )
+                        img_bytes = resp.content
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"Failed to fetch remote image: {exc}")
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported image_url format: {url[:80]}")
 
-    async def _materialize_file_refs(client: BrowserClient, file_refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Resolve TOS/data/http file_url references to uploaded file metadata."""
+            if img_bytes is not None:
+                uploaded = await client.upload_image(image_bytes=img_bytes, filename=name)
+                images.append(uploaded)
+        return images
+
+    async def _materialize_file_refs(client: BrowserClient, file_refs: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], str]:
+        """Resolve TOS/data/http file_url references to uploaded file metadata and extract text context if readable."""
         import base64
         import mimetypes
         from urllib.parse import urlparse
         files: list[dict[str, Any]] = []
+        text_contexts: list[str] = []
         for file_ref in file_refs:
             url = str(file_ref.get("url", "")).strip()
             if not url:
@@ -558,6 +635,7 @@ def create_app(
             if url.startswith("tos-"):
                 files.append({"uri": url, "name": name, "size": size})
                 continue
+            file_data = None
             if url.startswith("data:"):
                 try:
                     header, encoded = url.split(",", 1)
@@ -568,10 +646,7 @@ def create_app(
                     mime_type = header[5:].split(";", 1)[0]
                     ext = mimetypes.guess_extension(mime_type) or ".txt"
                     name = f"upload{ext}"
-                uploaded = await client.upload_file(file_data=file_data, filename=name)
-                files.append({"uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"]})
-                continue
-            if url.startswith("http://") or url.startswith("https://"):
+            elif url.startswith("http://") or url.startswith("https://"):
                 if not is_safe_url(url):
                     raise HTTPException(
                         status_code=400,
@@ -579,6 +654,8 @@ def create_app(
                     )
                 parsed = urlparse(url)
                 inferred_name = parsed.path.rsplit("/", 1)[-1] or "downloaded_file"
+                if "." not in inferred_name:
+                    inferred_name += ".txt"
                 if name == "file":
                     name = inferred_name
                 max_download_bytes = int(os.environ.get("MAX_DOWNLOAD_SIZE_MB", "50")) * 1024 * 1024
@@ -601,11 +678,26 @@ def create_app(
                     raise
                 except Exception as exc:
                     raise HTTPException(status_code=502, detail=f"Failed to fetch remote file: {exc}")
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file_url: {url[:80]}")
+
+            if file_data is not None:
+                try:
+                    text = file_data.decode("utf-8")
+                    if text.strip() and len(text) < 200000:
+                        text_contexts.append(f"[附带文件: {name}]\n{text}\n[附带文件结束]")
+                except UnicodeDecodeError:
+                    try:
+                        text = file_data.decode("gbk")
+                        if text.strip() and len(text) < 200000:
+                            text_contexts.append(f"[附带文件: {name}]\n{text}\n[附带文件结束]")
+                    except UnicodeDecodeError:
+                        pass
                 uploaded = await client.upload_file(file_data=file_data, filename=name)
                 files.append({"uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"]})
-                continue
-            raise HTTPException(status_code=400, detail=f"Unsupported file_url: {url[:80]}")
-        return files
+
+        context_str = "\n\n".join(text_contexts)
+        return files, context_str
 
     async def _resolve_image_to_key(client: BrowserClient, image_input: Any) -> str:
         """Resolve TOS key, data URI, base64 string, or remote HTTP URL to a ByteDance TOS key."""
@@ -889,9 +981,11 @@ def create_app(
             elif body.enable_thinking is False or (body.reasoning_effort and body.reasoning_effort == "none"):
                 use_deep_think = 0
 
-            prompt, file_refs = _extract_prompt_and_file_refs(body.messages)
-            if not prompt:
+            prompt, file_refs, image_refs = _extract_prompt_and_file_refs(body.messages)
+            if not prompt and not file_refs and not image_refs:
                 raise HTTPException(status_code=400, detail="No text content")
+            if not prompt:
+                prompt = "请描述这张图片" if image_refs else "请总结或分析所附带的文件内容"
 
         await bucket.acquire()
         client = _get_client()
@@ -917,20 +1011,25 @@ def create_app(
         else:
             auto_delete = _auto_delete_conv and (not body.conversation_id)
 
+        # Materialize image and file references if provided
+        image_attachments = None
+        file_attachments = None
+        if image_refs:
+            image_attachments = await _materialize_image_refs(client, image_refs)
+        if file_refs:
+            file_attachments, text_ctx = await _materialize_file_refs(client, file_refs)
+            if text_ctx:
+                prompt = f"{prompt}\n\n{text_ctx}" if prompt else text_ctx
+
         if body.stream:
-            if not has_tools:
-                _, file_refs_check = _extract_prompt_and_file_refs(body.messages)
-                if file_refs_check:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="file_url attachments are currently supported for non-streaming requests only",
-                    )
             return StreamingResponse(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
                              conversation_id=body.conversation_id, bot_id=body.bot_id,
                              has_tools=has_tools,
                              messages_for_counting=body.messages,
-                             auto_delete=auto_delete),
+                             auto_delete=auto_delete,
+                             image_attachments=image_attachments,
+                             file_attachments=file_attachments),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -942,6 +1041,8 @@ def create_app(
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    image_attachments=image_attachments,
+                    file_attachments=file_attachments,
                 )
                 # Report to expert tracker (detect silent downgrade)
                 had_reasoning = bool(message.get("reasoning_content"))
@@ -959,21 +1060,12 @@ def create_app(
                     finish_reason = "tool_calls"
                 else:
                     finish_reason = "stop"
-            elif file_refs:
-                files = await _materialize_file_refs(client, file_refs)
-                result = await client.chat_with_file(
-                    text=prompt,
-                    file_uri=files,
-                    file_name=files[0]["name"],
-                    file_size=files[0]["size"],
-                    use_deep_think=use_deep_think,
-                )
-                message = {"role": "assistant", "content": result["text"]}
-                finish_reason = "stop"
             else:
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    image_attachments=image_attachments,
+                    file_attachments=file_attachments,
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
@@ -1552,6 +1644,8 @@ def create_app(
         *,
         conversation_id: Optional[str] = None,
         bot_id: Optional[str] = None,
+        image_attachments: Optional[list[dict[str, Any]]] = None,
+        file_attachments: Optional[list[dict[str, Any]]] = None,
     ) -> dict:
         """Collect full chat response with thinking separation.
 
@@ -1577,6 +1671,8 @@ def create_app(
             prompt, use_deep_think=use_deep_think,
             conversation_id=conversation_id or None,
             bot_id=bot_id or None,
+            image_attachments=image_attachments,
+            file_attachments=file_attachments,
         ):
             if event.get("error"):
                 raise RuntimeError(
@@ -1675,6 +1771,8 @@ def create_app(
         has_tools: bool = False,
         messages_for_counting: Optional[list] = None,
         auto_delete: bool = False,
+        image_attachments: Optional[list[dict[str, Any]]] = None,
+        file_attachments: Optional[list[dict[str, Any]]] = None,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -1724,6 +1822,8 @@ def create_app(
                 prompt, use_deep_think=use_deep_think,
                 conversation_id=conversation_id or None,
                 bot_id=bot_id or None,
+                image_attachments=image_attachments,
+                file_attachments=file_attachments,
             ).__aiter__()
 
             while True:
