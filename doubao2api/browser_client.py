@@ -157,6 +157,7 @@ class BrowserClient:
         # Robustness: failure tracking
         self._consecutive_failures: int = 0
         self._last_error_code: int = 0
+        self._last_error_category: str = ""
         self._needs_captcha: bool = False
         self._mode_lock: asyncio.Lock = asyncio.Lock()
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
@@ -192,16 +193,27 @@ class BrowserClient:
     def last_error_code(self) -> int:
         return self._last_error_code
 
+    @property
+    def last_error_category(self) -> str:
+        return self._last_error_category
+
     def record_success(self):
         """Reset failure counters on successful request."""
         self._consecutive_failures = 0
         self._last_error_code = 0
+        self._last_error_category = ""
         self._needs_captcha = False
+        if self.account_manager:
+            active = self.account_manager.get_active_account()
+            if active:
+                self.account_manager.clear_captcha_status(active.id)
 
     def clear_captcha(self):
         """Manually or automatically clear the needs_captcha flag."""
         self._needs_captcha = False
         self._consecutive_failures = 0
+        self._last_error_code = 0
+        self._last_error_category = ""
         log.info("Captcha flag cleared")
 
     async def is_captcha_visible(self) -> bool:
@@ -281,8 +293,6 @@ class BrowserClient:
             solver = SliderCaptchaSolver()
             solved = await solver.detect_and_solve(self._page)
             if solved:
-                self.clear_captcha()
-                self.record_success()
                 self._ready = True
                 log.info("Auto-solved slider captcha successfully!")
                 return True
@@ -291,13 +301,24 @@ class BrowserClient:
             log.warning("Automated captcha solver error: %s", e)
             return False
 
-    def record_failure(self, error_code: int = 0):
-        """Track consecutive failures. Mark captcha-needed on 710022002 or 710022004."""
+    def record_failure(
+        self,
+        error_code: int = 0,
+        *,
+        verification_required: Optional[bool] = None,
+        error_category: Optional[str] = None,
+    ):
+        """Track failures and mark verification only when the failure was classified as such."""
         self._consecutive_failures += 1
         self._last_error_code = error_code
-        if error_code in (710022002, 710022004):
+        self._last_error_category = error_category or (
+            "verification"
+            if verification_required is True or (verification_required is None and error_code == 710022002)
+            else ""
+        )
+        if verification_required is True or (verification_required is None and error_code == 710022002):
             self._needs_captcha = True
-            log.warning("Captcha/risk flag marked on error code %s", error_code)
+            log.warning("Verification flag marked on error code %s", error_code)
         if self._consecutive_failures >= 10 and not self._needs_captcha:
             log.error("10 consecutive failures (non-captcha) - marking not ready")
             self._ready = False
@@ -998,10 +1019,10 @@ class BrowserClient:
                 elif isinstance(sig, str) and sig:
                     return f"{base_url}?{query_string}&X-Bogus={sig}"
 
-                last_error = f"empty signature: {sig}"
+                last_error = "empty signature"
             except Exception as e:
-                last_error = str(e)
-                log.warning("frontierSign attempt %d failed: %s", attempt + 1, e)
+                last_error = f"signing failed ({type(e).__name__})"
+                log.warning("frontierSign attempt %d failed (%s)", attempt + 1, type(e).__name__)
 
             if attempt < 2:
                 await asyncio.sleep(1)
@@ -1285,7 +1306,7 @@ class BrowserClient:
             try:
                 exc = task.exception()
                 if exc:
-                    log.error("eval_task crashed for %s: %s", request_id, exc)
+                    log.error("eval_task crashed for %s (%s)", request_id, type(exc).__name__)
                     queue.put_nowait(f"__ERROR__:{exc}")
             except (asyncio.CancelledError, Exception):
                 pass
@@ -1293,21 +1314,23 @@ class BrowserClient:
         eval_task.add_done_callback(_on_eval_done)
 
         # Yield parsed SSE events from queue
+        stream_complete = False
         try:
             while True:
                 chunk_json = await asyncio.wait_for(queue.get(), timeout=180)
                 if chunk_json is None:
                     # Stream complete
+                    stream_complete = True
                     break
                 if chunk_json.startswith("__ERROR__:"):
                     error_msg = chunk_json[10:]
-                    log.error("Browser fetch error: %s", error_msg[:200])
+                    log.error("Browser fetch failed for request %s", request_id)
                     yield {"error": True, "status": 0, "body": error_msg}
                     break
                 if chunk_json.startswith("__HTTP_ERROR__:"):
                     status = int(chunk_json[15:].split(":", 1)[0])
                     body = chunk_json[15:].split(":", 1)[1] if ":" in chunk_json[15:] else ""
-                    log.error("API error %d: %s", status, body[:200])
+                    log.error("Upstream HTTP request failed with status %d", status)
                     yield {"error": True, "status": status, "body": body}
                     break
                 # Parse SSE line
@@ -1321,8 +1344,29 @@ class BrowserClient:
             yield {"error": True, "status": 0, "body": "Stream timeout"}
         finally:
             self._stream_queues.pop(request_id, None)
+            if stream_complete and not eval_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(eval_task), timeout=2.0)
+                except (asyncio.TimeoutError, Exception):
+                    pass
             if not eval_task.done():
+                if self._page and not self._page.is_closed():
+                    try:
+                        await asyncio.wait_for(
+                            self._page.evaluate(
+                                """requestId => {
+                                    const controllers = window.__doubaoStreamAbortControllers;
+                                    const controller = controllers && controllers.get(requestId);
+                                    if (controller) controller.abort();
+                                }""",
+                                request_id,
+                            ),
+                            timeout=2.0,
+                        )
+                    except Exception as exc:
+                        log.debug("Browser stream abort failed (%s)", type(exc).__name__)
                 eval_task.cancel()
+                await asyncio.gather(eval_task, return_exceptions=True)
             else:
                 # Check for exceptions
                 try:
@@ -1336,6 +1380,11 @@ class BrowserClient:
         """Execute fetch() inside browser page and stream SSE chunks via callback."""
         js_code = """
         async ([url, payloadJson, requestId]) => {
+            const controllers = window.__doubaoStreamAbortControllers ||
+                (window.__doubaoStreamAbortControllers = new Map());
+            const controller = new AbortController();
+            controllers.set(requestId, controller);
+            let reader = null;
             const sendChunk = async (chunk) => {
                 if (typeof window.__doubaoStreamChunk === 'function') {
                     try {
@@ -1361,13 +1410,14 @@ class BrowserClient:
                     headers: headers,
                     body: payloadJson,
                     credentials: 'include',
+                    signal: controller.signal,
                 });
                 if (!res.ok) {
                     const errBody = await res.text();
                     await sendChunk('__HTTP_ERROR__:' + res.status + ':' + errBody.slice(0, 500));
                     return;
                 }
-                const reader = res.body.getReader();
+                reader = res.body.getReader();
                 const decoder = new TextDecoder();
                 let currentEvent = '';
                 let buffer = '';
@@ -1412,8 +1462,15 @@ class BrowserClient:
                 // Signal completion
                 await sendChunk(null);
             } catch(e) {
-                await sendChunk('__ERROR__:' + e.message);
-                throw e;
+                if (e.name !== 'AbortError') {
+                    await sendChunk('__ERROR__:' + e.message);
+                    throw e;
+                }
+            } finally {
+                if (reader) {
+                    try { await reader.cancel(); } catch(e) {}
+                }
+                controllers.delete(requestId);
             }
         }
         """

@@ -22,8 +22,11 @@ def test_record_failure_risk_codes():
     assert client.needs_captcha is False
     assert client.consecutive_failures == 0
 
-    # 4. Error 710022004 should also trigger needs_captcha
+    # 4. A risk code alone must not mark verification without classification
     client.record_failure(710022004)
+    assert client.needs_captcha is False
+
+    client.record_failure(710022004, verification_required=True)
     assert client.needs_captcha is True
 
 def test_auto_popup_for_captcha():
