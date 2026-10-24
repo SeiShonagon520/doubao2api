@@ -738,6 +738,80 @@ def create_app(
             for item in (image_attachments or []) + (file_attachments or [])
         )
 
+    def _cache_uploaded_image_metadata(client: Any, uploaded: dict[str, Any]) -> None:
+        uri = uploaded.get("uri")
+        if not isinstance(uri, str) or not uri:
+            return
+        registry = getattr(client, "_uploaded_image_metadata", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            setattr(client, "_uploaded_image_metadata", registry)
+        manager = getattr(client, "account_manager", None)
+        active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+        registry[uri] = {
+            "uri": uri,
+            "cdn_url": uploaded.get("cdn_url", ""),
+            "name": uploaded.get("name", ""),
+            "format": uploaded.get("format", ""),
+            "width": uploaded.get("width"),
+            "height": uploaded.get("height"),
+            "_account_id": active.id if active else None,
+        }
+
+    def _video_image_attachments(client: Any, image_keys: list[str]) -> list[dict[str, Any]]:
+        registry = getattr(client, "_uploaded_image_metadata", {})
+        manager = getattr(client, "account_manager", None)
+        active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+        attachments = []
+        for uri in image_keys:
+            metadata = registry.get(uri) if isinstance(registry, dict) else None
+            if not isinstance(metadata, dict):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Video reference image metadata is unavailable; upload the source image again.",
+                )
+            owner_id = metadata.get("_account_id")
+            if active and owner_id != active.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Video reference image metadata belongs to another account.",
+                )
+            if isinstance(manager, AccountManager) and not active:
+                raise HTTPException(status_code=409, detail="No active account owns the video reference image.")
+            cdn_url = metadata.get("cdn_url")
+            parsed = urlparse(cdn_url) if isinstance(cdn_url, str) else None
+            width, height = metadata.get("width"), metadata.get("height")
+            name, image_format = metadata.get("name"), metadata.get("format")
+            if (
+                metadata.get("uri") != uri
+                or not parsed
+                or parsed.scheme not in ("http", "https")
+                or not parsed.hostname
+                or not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(image_format, str)
+                or not image_format.strip()
+                or isinstance(width, bool)
+                or not isinstance(width, int)
+                or width <= 0
+                or isinstance(height, bool)
+                or not isinstance(height, int)
+                or height <= 0
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Video reference image metadata is incomplete; upload the source image again.",
+                )
+            attachments.append({
+                "uri": uri,
+                "cdn_url": cdn_url,
+                "name": name,
+                "format": image_format,
+                "width": width,
+                "height": height,
+            })
+        return attachments
+
     async def _reupload_chat_attachments(
         client: BrowserClient,
         image_attachments: Optional[list[dict[str, Any]]],
@@ -753,6 +827,7 @@ def create_app(
                 image_bytes=image["_source_bytes"],
                 filename=image.get("_source_name") or image.get("name") or "image.png",
             )
+            _cache_uploaded_image_metadata(client, uploaded)
             _register_account_resource(client, uploaded.get("uri", ""))
             image.update(uploaded)
         for file in file_attachments or []:
@@ -781,10 +856,12 @@ def create_app(
                 image_bytes=source["source_bytes"],
                 filename=source.get("filename") or "ref_image.png",
             )
+            _cache_uploaded_image_metadata(client, uploaded)
             new_key = uploaded.get("uri", "")
             _register_account_resource(client, new_key)
             replacements[key] = new_key
             source["uri"] = new_key
+            source.update({k: v for k, v in uploaded.items() if k != "uri"})
         return [replacements.get(key, key) for key in image_keys]
 
     async def _resolve_image_to_key(
@@ -839,6 +916,7 @@ def create_app(
                 raise HTTPException(status_code=400, detail=f"Invalid image data URI: {exc}") from exc
             uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
             key = uploaded.get("uri", "")
+            _cache_uploaded_image_metadata(client, uploaded)
             if sources is not None and key:
                 sources.append({"uri": key, "source_bytes": image_bytes, "filename": filename})
             _register_account_resource(client, key)
@@ -879,6 +957,7 @@ def create_app(
 
             uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
             key = uploaded.get("uri", "")
+            _cache_uploaded_image_metadata(client, uploaded)
             if sources is not None and key:
                 sources.append({"uri": key, "source_bytes": image_bytes, "filename": filename})
             _register_account_resource(client, key)
@@ -890,6 +969,7 @@ def create_app(
             if len(image_bytes) > 0:
                 uploaded = await client.upload_image(image_bytes=image_bytes, filename="ref_image.png")
                 key = uploaded.get("uri", "")
+                _cache_uploaded_image_metadata(client, uploaded)
                 if sources is not None and key:
                     sources.append({"uri": key, "source_bytes": image_bytes, "filename": "ref_image.png"})
                 _register_account_resource(client, key)
@@ -915,6 +995,7 @@ def create_app(
                 filename = getattr(item, "filename", "ref_image.png") or "ref_image.png"
                 uploaded = await client.upload_image(image_bytes=file_bytes, filename=filename)
                 key = uploaded.get("uri", "")
+                _cache_uploaded_image_metadata(client, uploaded)
                 if sources is not None and key:
                     sources.append({"uri": key, "source_bytes": file_bytes, "filename": filename})
                 _register_account_resource(client, key)
@@ -1852,6 +1933,8 @@ def create_app(
             call_kwargs = dict(history_kwargs)
             if len(ref_image_keys) > 1:
                 call_kwargs["ref_image_keys"] = list(ref_image_keys)
+            if ref_image_keys:
+                call_kwargs["image_attachments"] = _video_image_attachments(client, ref_image_keys)
             try:
                 result = await client.generate_video(
                     prompt=prompt,
@@ -1894,6 +1977,8 @@ def create_app(
                     raise HTTPException(status_code=429, detail="Video quota is exhausted for all available accounts.")
                 ref_image_keys = await _reupload_image_sources(client, ref_image_keys, image_sources)
                 ref_image_key = ref_image_keys[0] if ref_image_keys else None
+            except UpstreamAPIError:
+                raise
             except RuntimeError as exc:
                 raise HTTPException(status_code=502, detail=str(exc))
 
@@ -2003,6 +2088,7 @@ def create_app(
             result = await client.upload_image(image_bytes=image_data, filename=filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        _cache_uploaded_image_metadata(client, result)
         _register_account_resource(client, result.get("uri", ""))
         return JSONResponse({
             "uri": result["uri"],

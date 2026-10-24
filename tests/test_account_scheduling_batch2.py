@@ -228,7 +228,14 @@ def test_video_quota_failover_reuploads_all_sources_and_preserves_options(tmp_pa
         uri_counts[account_id] += 1
         uri = f"tos-{account_id}-image-{uri_counts[account_id]}"
         upload_calls.append((account_id, image_bytes, filename, uri))
-        return {"uri": uri}
+        return {
+            "uri": uri,
+            "cdn_url": f"https://image.test/{uri}.png",
+            "name": filename,
+            "format": "png",
+            "width": 640,
+            "height": 480,
+        }
 
     async def mock_generate_video(**kwargs):
         account_id = manager.active_account_id
@@ -268,6 +275,8 @@ def test_video_quota_failover_reuploads_all_sources_and_preserves_options(tmp_pa
         assert kwargs["ratio"] == "16:9"
         assert kwargs["ref_image_keys"] == [f"tos-{account_id}-image-1", f"tos-{account_id}-image-2"]
         assert kwargs["ref_image_key"] == f"tos-{account_id}-image-1"
+        assert [item["uri"] for item in kwargs["image_attachments"]] == kwargs["ref_image_keys"]
+        assert all(item["width"] == 640 and item["height"] == 480 for item in kwargs["image_attachments"])
         assert {key: kwargs[key] for key in expected_history} == expected_history
 
 
@@ -280,7 +289,14 @@ def test_multipart_image_bytes_are_retained_after_upload_consumes_stream(tmp_pat
         account_id = manager.active_account_id
         uri = f"tos-{account_id}-frame"
         uploads.append((account_id, image_bytes, filename, uri))
-        return {"uri": uri}
+        return {
+            "uri": uri,
+            "cdn_url": f"https://image.test/{uri}.png",
+            "name": filename,
+            "format": "png",
+            "width": 320,
+            "height": 240,
+        }
 
     async def generate_video(**kwargs):
         account_id = manager.active_account_id
@@ -322,7 +338,15 @@ def test_video_quota_switch_failure_skips_failed_candidate(tmp_path):
     async def upload(image_bytes, filename):
         nonlocal uploads
         uploads += 1
-        return {"uri": f"tos-{manager.active_account_id}-{uploads}"}
+        uri = f"tos-{manager.active_account_id}-{uploads}"
+        return {
+            "uri": uri,
+            "cdn_url": f"https://image.test/{uri}.png",
+            "name": filename,
+            "format": "png",
+            "width": 640,
+            "height": 480,
+        }
 
     async def generate(**kwargs):
         account_id = manager.active_account_id
@@ -393,23 +417,24 @@ def test_video_empty_upstream_result_is_gateway_error_without_echoing_message(tm
 def test_browser_video_quota_payloads_raise_without_internal_failover(tmp_path, quota_branch):
     async def run():
         client, manager, accounts = _client_with_accounts(tmp_path, strategy="failover", count=2)
+        quota_message = "今日生成次数已达上限"
         if quota_branch == "event":
-            event = {"event_type": 2005, "event_data": "今日生成次数已达上限"}
+            async def mock_chat(*args, **kwargs):
+                yield {
+                    "error": True,
+                    "status": 429,
+                    "body": json.dumps({"code": 429, "error_msg": quota_message}, ensure_ascii=False),
+                }
         else:
-            content = json.dumps({"text": "今日生成次数已达上限"}, ensure_ascii=False)
-            event = {
-                "event_type": 2001,
-                "event_data": {
-                    "message": {"content_type": 2001, "content": content},
-                },
-            }
-        client._samantha_request = AsyncMock(return_value=f"data: {json.dumps(event, ensure_ascii=False)}\n\n")
+            async def mock_chat(*args, **kwargs):
+                yield {"_event": "CHUNK_DELTA", "text": quota_message}
+
+        client.chat_completion = mock_chat
         client.switch_to_account = AsyncMock(return_value=True)
 
         with pytest.raises(VideoQuotaExceeded):
             await client.generate_video(prompt="no real call")
 
-        assert client._samantha_request.await_count == 1
         assert manager.get_account(accounts[0].id).video_quota_exceeded is True
         assert manager.get_account(accounts[0].id).status == "active"
         client.switch_to_account.assert_not_awaited()
@@ -445,7 +470,7 @@ def test_video_quota_raw_tos_reference_returns_explicit_conflict(tmp_path):
     )
 
     assert response.status_code == 409
-    assert "TOS" in response.json()["error"]["message"]
+    assert "metadata is unavailable" in response.json()["error"]["message"]
     client.switch_to_account.assert_not_awaited()
 
 
