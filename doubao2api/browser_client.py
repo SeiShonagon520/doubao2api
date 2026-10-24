@@ -133,39 +133,6 @@ def resolve_memory_type(
     return 2
 
 
-def bring_window_to_foreground():
-    """Attempt to bring the browser window to the foreground on Windows."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-        from ctypes import wintypes
-
-        user32 = ctypes.windll.user32
-        targets = []
-
-        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-        def _enum_proc(hwnd, lparam):
-            if user32.IsWindowVisible(hwnd):
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(hwnd, buf, length + 1)
-                    title = buf.value
-                    if any(k in title for k in ("豆包", "Doubao", "doubao.com", "Chrome", "Edge")):
-                        targets.append(hwnd)
-            return True
-
-        user32.EnumWindows(WNDENUMPROC(_enum_proc), 0)
-        for hwnd in targets:
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            user32.SetForegroundWindow(hwnd)
-            user32.BringWindowToTop(hwnd)
-    except Exception as e:
-        log.debug("bring_window_to_foreground error: %s", e)
-
-
 class BrowserClient:
     """Manages Playwright for login and in-browser fetch for API calls."""
 
@@ -708,16 +675,13 @@ class BrowserClient:
                     if await self.is_alive():
                         if not self.headless:
                             await self._page.bring_to_front()
-                            bring_window_to_foreground()
                             log.info("Browser window brought to front")
                         return True
                 except Exception:
                     pass
             log.info("Browser window not active or mode switched, relaunching window...")
             await self.restart()
-            if not self.headless:
-                bring_window_to_foreground()
-            return self._ready
+            return await self.is_alive()
 
     @classmethod
     def is_profile_logged_in(cls, user_data_dir: Optional[str]) -> bool:

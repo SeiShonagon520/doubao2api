@@ -5,7 +5,6 @@ import json
 import threading
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
-from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -374,6 +373,22 @@ def test_video_quota_exhaustion_attempts_each_account_once(tmp_path):
     assert client.generate_video.await_count == 2
 
 
+def test_video_empty_upstream_result_is_gateway_error_without_echoing_message(tmp_path):
+    client, _, _ = _client_with_accounts(tmp_path, strategy="failover", count=1)
+    client.generate_video = AsyncMock(
+        return_value={"videos": [], "message": "provider-internal-detail"}
+    )
+
+    response = TestClient(create_app(browser_client=client)).post(
+        "/v1/video/generations", json={"prompt": "single bounded attempt"}
+    )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["message"] == "Video generation failed (upstream_no_result)"
+    assert "provider-internal-detail" not in response.text
+    client.generate_video.assert_awaited_once()
+
+
 @pytest.mark.parametrize("quota_branch", ["event", "full_text"])
 def test_browser_video_quota_payloads_raise_without_internal_failover(tmp_path, quota_branch):
     async def run():
@@ -674,6 +689,11 @@ def test_background_login_wait_does_not_hold_browser_gate(tmp_path):
 
     client.wait_for_login = wait_for_login
     client.switch_mode = AsyncMock(return_value=True)
+    client.headless = False
+    page = MagicMock()
+    page.is_closed.return_value = False
+    page.bring_to_front = AsyncMock()
+    client._page = page
     app = create_app(browser_client=client)
 
     with TestClient(app) as test_client:

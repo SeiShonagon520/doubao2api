@@ -42,3 +42,32 @@ def test_auto_popup_for_captcha():
         client.switch_mode.assert_called_once_with(headless=False)
         mock_page.bring_to_front.assert_called_once()
     asyncio.run(_run())
+
+
+def test_switch_mode_reports_open_unlogged_page_as_available():
+    async def _run():
+        client = BrowserClient(headless=True)
+        client._ready = False
+        client._page = MagicMock()
+        client._page.is_closed.return_value = True
+        client._context = MagicMock()
+        live_page = MagicMock()
+        live_page.is_closed.return_value = False
+
+        async def restart():
+            client._page = live_page
+            client._context = MagicMock()
+            client._ready = False
+
+        client.restart = AsyncMock(side_effect=restart)
+        client.is_alive = AsyncMock(return_value=True)
+
+        available = await client.switch_mode(headless=False)
+
+        assert available is True
+        assert client.is_ready is False
+        assert client.headless is False
+        client.restart.assert_awaited_once()
+        client.is_alive.assert_awaited_once()
+
+    asyncio.run(_run())

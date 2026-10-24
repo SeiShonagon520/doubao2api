@@ -1900,7 +1900,11 @@ def create_app(
         videos = result.get("videos", [])
         msg = result.get("message", "")
         if not videos and msg:
-            return JSONResponse({"created": int(time.time()), "data": [], "message": msg})
+            log.warning("Video generation returned an upstream message without a video result")
+            raise HTTPException(
+                status_code=502,
+                detail="Video generation failed (upstream_no_result)",
+            )
         if not videos:
             raise HTTPException(status_code=502, detail="No videos generated")
 
@@ -3404,27 +3408,31 @@ def create_app(
         if client is None:
             raise HTTPException(status_code=503, detail="Browser not initialized")
         try:
-            # Always ensure an active, visible window
-            await client.switch_mode(headless=False)
-            if client.page and not client.page.is_closed():
+            switched = await client.switch_mode(headless=False)
+            page = client.page
+            if not switched or page is None or page.is_closed():
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "error", "detail": "Managed browser window is unavailable"},
+                )
+            await page.bring_to_front()
+            # Click login button if not logged in and modal not open.
+            if not client.is_ready:
                 try:
-                    await client.page.bring_to_front()
+                    modal = page.locator('[role="dialog"], .semi-modal')
+                    if await modal.count() == 0:
+                        btn = page.locator('button:has-text("登录")')
+                        if await btn.count() > 0 and await btn.first.is_visible():
+                            await btn.first.click()
                 except Exception:
                     pass
-                # Click login button if not logged in and modal not open
-                if not client.is_ready:
-                    try:
-                        modal = client.page.locator('[role="dialog"], .semi-modal')
-                        if await modal.count() == 0:
-                            btn = client.page.locator('button:has-text("登录")')
-                            if await btn.count() > 0 and await btn.first.is_visible():
-                                 await btn.first.click()
-                    except Exception:
-                        pass
             return {"status": "ok", "mode": "window", "headless": client.headless, "browser_name": getattr(client, "browser_name", "chromium")}
         except Exception as e:
-            log.error("Failed to force window: %s", e)
-            return {"status": "error", "detail": str(e)}
+            log.error("Failed to force window (%s)", type(e).__name__)
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "detail": "Managed browser window is unavailable"},
+            )
 
     @app.post("/admin/api/browser/install-chromium")
     async def admin_install_chromium(request: Request):
