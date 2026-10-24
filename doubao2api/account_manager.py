@@ -68,7 +68,7 @@ class AccountManager:
 
         self.active_account_id: Optional[str] = None
         self.accounts: Dict[str, Account] = {}
-        self._round_robin_index = 0
+        self._round_robin_last_id: Optional[str] = None
 
         self.load()
 
@@ -123,13 +123,13 @@ class AccountManager:
         except Exception as e:
             log.error("Failed to save accounts to %s: %s", self.filepath, e)
 
-    def reset_daily_quotas_if_needed(self) -> None:
+    def reset_daily_quotas_if_needed(self, today: Optional[date] = None) -> None:
         """Reset quota exceeded flags if a new day has arrived."""
-        today_str = date.today().isoformat()
+        today_str = (today or date.today()).isoformat()
         changed = False
         for acc in self.accounts.values():
             if acc.quota_reset_date != today_str:
-                if acc.video_quota_exceeded:
+                if acc.video_quota_exceeded or acc.status == "quota_exceeded":
                     acc.video_quota_exceeded = False
                     if acc.status == "quota_exceeded":
                         acc.status = "active"
@@ -178,18 +178,14 @@ class AccountManager:
 
     def get_active_account(self) -> Optional[Account]:
         self.reset_daily_quotas_if_needed()
-        if not self.active_account_id:
-            if self.accounts:
-                self.active_account_id = next(iter(self.accounts.keys()))
-            else:
-                return None
-        return self.accounts.get(self.active_account_id)
+        return self.accounts.get(self.active_account_id) if self.active_account_id else None
 
     def set_active_account(self, account_id: str) -> bool:
         """Set the active account."""
         if account_id in self.accounts:
             self.active_account_id = account_id
             self.accounts[account_id].last_used = time.time()
+            self._round_robin_last_id = account_id
             self.save()
             return True
         return False
@@ -199,7 +195,9 @@ class AccountManager:
         if account_id in self.accounts:
             del self.accounts[account_id]
             if self.active_account_id == account_id:
-                self.active_account_id = next(iter(self.accounts.keys())) if self.accounts else None
+                self.active_account_id = None
+            if self._round_robin_last_id == account_id:
+                self._round_robin_last_id = None
             self.save()
             return True
         return False
@@ -229,7 +227,6 @@ class AccountManager:
         acc = self.accounts[target_id]
         if feature == "video":
             acc.video_quota_exceeded = True
-            acc.status = "quota_exceeded"
         acc.quota_reset_date = date.today().isoformat()
         log.warning("Account %s (%s) marked as quota exceeded for %s", acc.id, acc.name, feature)
         self.save()
@@ -268,46 +265,51 @@ class AccountManager:
         return False
 
     def has_alternative_accounts(self, feature: str = "video") -> bool:
-        """Check if there are other healthy accounts available."""
+        """Check whether another account is eligible for the requested feature."""
+        return any(acc.id != self.active_account_id for acc in self.get_available_accounts(feature))
+
+    def get_available_accounts(
+        self,
+        feature: str = "chat",
+        exclude_ids: Optional[set[str]] = None,
+    ) -> List[Account]:
+        """Return eligible accounts in scheduling order without changing manager state."""
         self.reset_daily_quotas_if_needed()
+        excluded = exclude_ids or set()
         available = [
             acc for acc in self.accounts.values()
-            if acc.status == "active" and not (feature == "video" and acc.video_quota_exceeded)
-            and acc.id != self.active_account_id
+            if acc.id not in excluded
+            and acc.status not in ("disabled", "invalid", "captcha")
+            and acc.status in ("active", "quota_exceeded")
+            and not (feature == "video" and (acc.video_quota_exceeded or acc.status == "quota_exceeded"))
         ]
-        return len(available) > 0
+        if self.strategy != "round_robin" or not available:
+            return available
 
-    def get_next_available_account(self, feature: str = "video") -> Optional[Account]:
-        """Get next available account based on rotation strategy."""
-        self.reset_daily_quotas_if_needed()
-        if not self.accounts:
-            return None
+        cursor_id = self._round_robin_last_id
+        if cursor_id is None and self.active_account_id in {acc.id for acc in available}:
+            active_index = next(i for i, acc in enumerate(available) if acc.id == self.active_account_id)
+            return available[active_index:] + available[:active_index]
+        cursor_index = next((i for i, acc in enumerate(available) if acc.id == cursor_id), None)
+        if cursor_index is None:
+            return available
+        next_index = (cursor_index + 1) % len(available)
+        return available[next_index:] + available[:next_index]
 
-        # Filter available accounts
-        available = [
-            acc for acc in self.accounts.values()
-            if acc.status == "active" and not (feature == "video" and acc.video_quota_exceeded)
-        ]
-
+    def get_next_available_account(
+        self,
+        feature: str = "chat",
+        exclude_ids: Optional[set[str]] = None,
+    ) -> Optional[Account]:
+        """Select a candidate without changing the active account or rotation cursor."""
+        available = self.get_available_accounts(feature, exclude_ids)
         if not available:
-            # If all are quota exceeded or disabled, return None
             return None
-
-        # 1. Failover Strategy: stick with current active if it is still available
         if self.strategy == "failover":
             active = self.get_active_account()
             if active and active in available:
                 return active
-            # Active account is exhausted/unavailable: pick the first available alternative
-            next_acc = available[0]
-            self.set_active_account(next_acc.id)
-            return next_acc
-
-        # 2. Round-Robin Strategy: rotate through all available accounts
-        self._round_robin_index = (self._round_robin_index + 1) % len(available)
-        selected = available[self._round_robin_index]
-        self.set_active_account(selected.id)
-        return selected
+        return available[0]
 
     def list_accounts(self, mask_cookies: bool = True) -> List[Dict[str, Any]]:
         """List all accounts for API/UI."""

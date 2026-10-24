@@ -30,6 +30,9 @@ import httpx
 import sys
 from datetime import datetime
 from typing import Optional
+import pytest
+
+pytestmark = pytest.mark.live
 
 BASE_URL = "http://127.0.0.1:9090"
 DELAY_BETWEEN_ROUNDS = 8  # seconds between requests to avoid rate limit

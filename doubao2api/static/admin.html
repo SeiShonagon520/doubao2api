@@ -411,7 +411,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:#6366f1;box-sh
                 <span v-if="test.ms" class="text-indigo-400 font-mono">耗时 {{test.ms}}ms</span>
               </div>
               <span v-if="test.loading" class="text-emerald-400 animate-pulse font-mono">● 正在流式生成中...</span>
-              <span v-else-if="test.output" class="text-emerald-400">✓ 生成完毕</span>
+              <span v-else-if="test.output && !test.error" class="text-emerald-400">✓ 生成完毕</span>
             </div>
 
             <!-- 深度思考内容 (如果存在) -->
@@ -1315,7 +1315,7 @@ createApp({
           browserMode.headless = false;
           browserMode.mode = 'window';
           if(r.browser_name) browserMode.browserName = r.browser_name;
-          alert('已请求唤起浏览器窗口！若任务栏闪烁请点击激活。');
+          alert('已打开独立桌面浏览器窗口。若任务栏闪烁，请点击激活。');
         }else{
           alert('唤起窗口提示: ' + (r.detail || '后台正在运行'));
         }
@@ -1540,15 +1540,19 @@ createApp({
               if(!line.startsWith('data: ')) continue;
               const d = line.slice(6);
               if(d === '[DONE]') continue;
+              let j;
               try{
-                const j = JSON.parse(d);
-                if(j.error) throw new Error(j.error.message || 'Stream error');
-                const delta = j.choices?.[0]?.delta || {};
-                if(delta.reasoning_content) test.thinking += delta.reasoning_content;
-                if(delta.content) test.output += delta.content;
+                j = JSON.parse(d);
               }catch(e){
-                if(e.message === 'Stream error') throw e;
+                continue;
               }
+              if(j.error){
+                const message = typeof j.error.message === 'string' ? j.error.message : 'Stream error';
+                throw new Error(message);
+              }
+              const delta = j.choices?.[0]?.delta || {};
+              if(delta.reasoning_content) test.thinking += delta.reasoning_content;
+              if(delta.content) test.output += delta.content;
             }
           }
         }else{

@@ -1,5 +1,8 @@
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
 from fastapi.testclient import TestClient
+from doubao2api.browser_client import BrowserClient
 from doubao2api.unified_server import create_app
 
 def test_web_ui_routes():
@@ -64,3 +67,50 @@ def test_web_ui_with_api_key():
     # System API with Bearer token should succeed
     resp = client.get("/admin/api/system", headers={"Authorization": "Bearer secret123"})
     assert resp.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "switch_result,page_present,page_closed,expected_status",
+    [
+        (False, True, False, 503),
+        (True, False, False, 503),
+        (True, True, True, 503),
+        (True, True, False, 200),
+    ],
+)
+def test_force_window_reports_managed_page_result(
+    tmp_path, switch_result, page_present, page_closed, expected_status
+):
+    browser = BrowserClient(headless=True, user_data_dir=str(tmp_path))
+    browser._ready = True
+    if switch_result:
+        browser.headless = False
+    browser.switch_mode = AsyncMock(return_value=switch_result)
+    page = MagicMock()
+    page.is_closed.return_value = page_closed
+    page.bring_to_front = AsyncMock()
+    browser._page = page if page_present else None
+
+    with TestClient(create_app(browser_client=browser)) as client:
+        response = client.post("/admin/api/browser/force-window")
+
+    assert response.status_code == expected_status
+    if expected_status == 200:
+        assert response.json()["status"] == "ok"
+        page.bring_to_front.assert_awaited_once()
+    else:
+        assert response.json()["status"] == "error"
+        assert response.json()["detail"] == "Managed browser window is unavailable"
+        if page_present:
+            page.bring_to_front.assert_not_awaited()
+
+
+def test_force_window_requires_admin_authentication(tmp_path):
+    browser = BrowserClient(headless=True, user_data_dir=str(tmp_path))
+    browser.switch_mode = AsyncMock(return_value=True)
+
+    with TestClient(create_app(api_key="secret", browser_client=browser)) as client:
+        response = client.post("/admin/api/browser/force-window")
+
+    assert response.status_code == 401
+    browser.switch_mode.assert_not_awaited()

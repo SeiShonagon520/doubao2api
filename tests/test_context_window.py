@@ -15,6 +15,9 @@ import os
 import time
 import httpx
 import sys
+import pytest
+
+pytestmark = pytest.mark.live
 
 BASE_URL = os.environ.get("DOUBAO_BASE_URL", "http://127.0.0.1:9090")
 

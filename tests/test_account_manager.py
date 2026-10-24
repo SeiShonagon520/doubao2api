@@ -3,6 +3,7 @@ Tests for AccountManager and Multi-Account Admin APIs.
 """
 import os
 import tempfile
+from datetime import date, timedelta
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from fastapi.testclient import TestClient
@@ -87,6 +88,8 @@ def test_failover_and_round_robin_strategy(temp_accounts_file):
     mgr.mark_quota_exceeded("a1", "video")
     next_acc = mgr.get_next_available_account("video")
     assert next_acc.id == "a2"
+    assert mgr.active_account_id == "a1"
+    assert mgr.set_active_account(next_acc.id) is True
     assert mgr.active_account_id == "a2"
 
     # Mark a2 quota exceeded -> no available account
@@ -103,8 +106,62 @@ def test_failover_and_round_robin_strategy(temp_accounts_file):
     mgr.reset_quota("a2")
     # Now both a1 and a2 are available
     r1 = mgr.get_next_available_account("video")
+    r1_again = mgr.get_next_available_account("video")
+    assert r1_again.id == r1.id
+    assert mgr.active_account_id == "a2"
+    mgr.set_active_account(r1.id)
     r2 = mgr.get_next_available_account("video")
-    assert {r1.id, r2.id} == {"a1", "a2"}
+    assert r2.id != r1.id
+
+
+def test_candidate_selection_is_pure_until_active_account_commit(temp_accounts_file):
+    mgr = AccountManager(filepath=temp_accounts_file, strategy="round_robin")
+    acc1 = mgr.add_or_update_account("Acc1", {"sessionid": "s1"}, account_id="a1")
+    acc2 = mgr.add_or_update_account("Acc2", {"sessionid": "s2"}, account_id="a2")
+    mgr.set_active_account(acc1.id)
+    before_last_used = {acc.id: acc.last_used for acc in (acc1, acc2)}
+    before_cursor = mgr._round_robin_last_id
+
+    first = mgr.get_next_available_account("chat")
+    second = mgr.get_next_available_account("chat")
+
+    assert first.id == acc2.id
+    assert second.id == first.id
+    assert mgr.active_account_id == acc1.id
+    assert mgr._round_robin_last_id == before_cursor
+    assert {acc.id: acc.last_used for acc in (acc1, acc2)} == before_last_used
+
+    mgr.set_active_account(first.id)
+    assert mgr.get_next_available_account("chat").id == acc1.id
+
+
+def test_video_quota_does_not_disable_chat_and_legacy_quota_resets(temp_accounts_file):
+    mgr = AccountManager(filepath=temp_accounts_file, strategy="failover")
+    acc1 = mgr.add_or_update_account("Acc1", {"sessionid": "s1"}, account_id="a1")
+    acc2 = mgr.add_or_update_account("Acc2", {"sessionid": "s2"}, account_id="a2")
+    mgr.mark_quota_exceeded(acc1.id, "video")
+
+    assert acc1.status == "active"
+    assert mgr.get_next_available_account("chat").id == acc1.id
+    assert mgr.get_next_available_account("image").id == acc1.id
+    assert mgr.get_next_available_account("video").id == acc2.id
+
+    acc1.video_quota_exceeded = False
+    acc1.status = "quota_exceeded"  # Legacy accounts used a shared status.
+    acc1.quota_reset_date = date.today().isoformat()
+    assert mgr.get_next_available_account("chat").id == acc1.id
+    assert mgr.get_next_available_account("video").id == acc2.id
+
+    mgr.reset_daily_quotas_if_needed(date.today() + timedelta(days=1))
+    assert acc1.status == "active"
+    assert acc1.video_quota_exceeded is False
+
+    acc2.status = "disabled"
+    acc2.video_quota_exceeded = True
+    acc2.quota_reset_date = (date.today() - timedelta(days=1)).isoformat()
+    mgr.reset_daily_quotas_if_needed(date.today())
+    assert acc2.status == "disabled"
+    assert acc2.video_quota_exceeded is False
 
 
 def test_admin_accounts_api(temp_accounts_file):

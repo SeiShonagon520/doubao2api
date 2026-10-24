@@ -30,6 +30,7 @@ dependencies = [
     "httpx>=0.27",
     "playwright>=1.40.0",
     "playwright-stealth>=2.0.0",
+    "Pillow>=10.0.0",
     "pydantic>=2.0",
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.9",
@@ -44,6 +45,9 @@ Issues = "https://github.com/SeiShonagon520/doubao2api/issues"
 [project.scripts]
 doubao2api = "doubao2api.__main__:main"
 
+[project.optional-dependencies]
+test = ["pytest>=7.4.3"]
+
 [tool.hatch.version]
 path = "doubao2api/__init__.py"
 
@@ -57,9 +61,10 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not live'"
 markers = [
     "unit: Unit tests (fast, no browser, no network)",
     "integration: Integration tests (FastAPI TestClient)",
-    "live: Live environment tests (requires active browser and account)",
+    "live: Live network probes (may require a running service, browser, and account)",
 ]
 

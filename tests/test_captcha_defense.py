@@ -62,7 +62,8 @@ def test_account_manager_captcha_lifecycle(tmp_path):
     next_acc = am.get_next_available_account()
     assert next_acc is not None
     assert next_acc.id == acc2.id
-    assert am.active_account_id == acc2.id
+    assert am.active_account_id == acc1.id
+    am.set_active_account(acc2.id)
 
     # Clear captcha status on acc1
     cleared = am.clear_captcha_status(acc1.id)
@@ -127,7 +128,11 @@ def test_captcha_failover_in_chat_completions(tmp_path):
     # Captcha is visible, auto-solver fails
     mock_client.is_captcha_visible = AsyncMock(return_value=True)
     mock_client.try_auto_solve_captcha = AsyncMock(return_value=False)
-    mock_client.switch_to_account = AsyncMock(return_value=True)
+    async def switch_to_account(account_id):
+        am.set_active_account(account_id)
+        return True
+
+    mock_client.switch_to_account = AsyncMock(side_effect=switch_to_account)
     mock_client.extract_conversation_id = MagicMock(return_value="c_test")
 
     # Mock chat completion stream
@@ -305,7 +310,13 @@ def test_new_stream_retries_once_after_verify_switch_before_output(tmp_path):
     client.account_manager = manager
     client._ready = True
     client.is_captcha_visible = AsyncMock(return_value=False)
-    client.switch_to_account = AsyncMock(return_value=True)
+
+    async def switch_to_account(account_id):
+        manager.set_active_account(account_id)
+        client._needs_captcha = False
+        return True
+
+    client.switch_to_account = AsyncMock(side_effect=switch_to_account)
     client.extract_conversation_id = MagicMock(return_value=None)
     attempts = 0
 
@@ -338,6 +349,8 @@ def test_new_stream_retries_once_after_verify_switch_before_output(tmp_path):
     assert attempts == 2
     client.switch_to_account.assert_awaited_once_with(acc2.id)
     assert client.needs_captcha is False
+    assert manager.active_account_id == acc2.id
+    assert manager.get_account(acc1.id).status == "captcha"
 
 
 def test_existing_stream_error_is_structured_without_account_switch(tmp_path):
