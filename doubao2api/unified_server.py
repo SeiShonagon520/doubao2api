@@ -37,7 +37,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .browser_client import BrowserClient
+from .account_manager import AccountManager
+from .browser_client import BrowserClient, VideoQuotaExceeded
+from .browser_operation import BrowserOperationGate, BrowserOperationMiddleware
 from .upstream_errors import UpstreamAPIError, UpstreamError, parse_upstream_error
 
 
@@ -379,6 +381,8 @@ def create_app(
     """Build and return a configured FastAPI application."""
 
     _browser: Dict[str, Any] = {"client": browser_client} if browser_client is not None else {}
+    _conversation_account_ids: Dict[str, str] = {}
+    _resource_account_ids: Dict[str, str] = {}
 
     async def _browser_watchdog():
         """Background task: check browser health, auto-detect login, auto-restart on crash, auto-heal captcha."""
@@ -391,20 +395,21 @@ def create_app(
             if client is None:
                 continue
             try:
-                alive = await client.is_alive()
-                if not alive:
-                    consecutive_dead += 1
-                    log.warning("Browser watchdog: health check failed (%d/3)", consecutive_dead)
-                    if consecutive_dead >= 3:
-                        log.error("Browser watchdog: process dead 3 consecutive checks, auto-relaunching window...")
-                        await client.restart()
+                async with client.operation_gate.lease():
+                    alive = await client.is_alive()
+                    if not alive:
+                        consecutive_dead += 1
+                        log.warning("Browser watchdog: health check failed (%d/3)", consecutive_dead)
+                        if consecutive_dead >= 3:
+                            log.error("Browser watchdog: process dead 3 consecutive checks, auto-relaunching window...")
+                            await client.restart()
+                            consecutive_dead = 0
+                    else:
                         consecutive_dead = 0
-                else:
-                    consecutive_dead = 0
-                    if not client.is_ready:
-                        await client._check_login_state()
-                        if client.is_ready:
-                            log.info("Browser client logged in successfully! sessionid confirmed.")
+                        if not client.is_ready:
+                            await client._check_login_state()
+                            if client.is_ready:
+                                log.info("Browser client logged in successfully! sessionid confirmed.")
             except Exception as e:
                 log.error("Browser watchdog error: %s", e)
 
@@ -495,6 +500,23 @@ def create_app(
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+    app.add_middleware(
+        BrowserOperationMiddleware,
+        get_client=lambda: _browser.get("client"),
+        paths={
+            "/v1/chat/completions", "/v1/images/generations", "/v1/images/edits",
+            "/v1/audio/generations", "/v1/video/generations", "/v1/files",
+            "/v1/files/download", "/v1/images/upload", "/v1/chat/completions/with-file",
+            "/v1/session/qr-login", "/admin/api/cookies", "/admin/api/cookies/import",
+            "/admin/api/accounts", "/admin/api/accounts/add", "/admin/api/accounts/save_current",
+            "/admin/api/accounts/switch", "/admin/api/accounts/delete", "/admin/api/accounts/strategy",
+            "/admin/api/accounts/reset_quota", "/admin/api/accounts/rename", "/admin/api/accounts/probe_all",
+            "/admin/api/accounts/clear_captcha", "/admin/api/probe", "/auth/login", "/auth/reset_captcha",
+            "/auth/eval", "/auth/screenshot", "/auth/status", "/admin/api/status",
+            "/admin/api/browser/status", "/admin/api/browser/mode", "/admin/api/browser/screenshot",
+            "/admin/api/browser/force-window", "/admin/api/browser/install-chromium",
+        },
     )
 
     bucket = _TokenBucket(rpm_limit)
@@ -617,6 +639,9 @@ def create_app(
 
             if img_bytes is not None:
                 uploaded = await client.upload_image(image_bytes=img_bytes, filename=name)
+                _register_account_resource(client, uploaded.get("uri", ""))
+                uploaded["_source_bytes"] = img_bytes
+                uploaded["_source_name"] = name
                 images.append(uploaded)
         return images
 
@@ -634,7 +659,7 @@ def create_app(
             name = file_ref.get("name") or "file"
             size = int(file_ref.get("size") or 0)
             if url.startswith("tos-"):
-                files.append({"uri": url, "name": name, "size": size})
+                files.append({"uri": url, "name": name, "size": size, "_source_bytes": None})
                 continue
             file_data = None
             if url.startswith("data:"):
@@ -695,12 +720,79 @@ def create_app(
                     except UnicodeDecodeError:
                         pass
                 uploaded = await client.upload_file(file_data=file_data, filename=name)
-                files.append({"uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"]})
+                _register_account_resource(client, uploaded["uri"])
+                files.append({
+                    "uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"],
+                    "_source_bytes": file_data,
+                })
 
         context_str = "\n\n".join(text_contexts)
         return files, context_str
 
-    async def _resolve_image_to_key(client: BrowserClient, image_input: Any) -> str:
+    def _attachments_reuploadable(
+        image_attachments: Optional[list[dict[str, Any]]],
+        file_attachments: Optional[list[dict[str, Any]]],
+    ) -> bool:
+        return all(
+            isinstance(item.get("_source_bytes"), bytes)
+            for item in (image_attachments or []) + (file_attachments or [])
+        )
+
+    async def _reupload_chat_attachments(
+        client: BrowserClient,
+        image_attachments: Optional[list[dict[str, Any]]],
+        file_attachments: Optional[list[dict[str, Any]]],
+    ) -> None:
+        if not _attachments_reuploadable(image_attachments, file_attachments):
+            raise HTTPException(
+                status_code=409,
+                detail="Account-bound TOS references cannot be reused after account switching; provide source bytes.",
+            )
+        for image in image_attachments or []:
+            uploaded = await client.upload_image(
+                image_bytes=image["_source_bytes"],
+                filename=image.get("_source_name") or image.get("name") or "image.png",
+            )
+            _register_account_resource(client, uploaded.get("uri", ""))
+            image.update(uploaded)
+        for file in file_attachments or []:
+            uploaded = await client.upload_file(
+                file_data=file["_source_bytes"],
+                filename=file.get("name") or "file.txt",
+            )
+            _register_account_resource(client, uploaded["uri"])
+            file.update({"uri": uploaded["uri"], "name": uploaded["name"], "size": uploaded["size"]})
+
+    async def _reupload_image_sources(
+        client: BrowserClient,
+        image_keys: list[str],
+        sources: list[dict[str, Any]],
+    ) -> list[str]:
+        source_by_key = {item["uri"]: item for item in sources}
+        replacements: dict[str, str] = {}
+        for key in image_keys:
+            source = source_by_key.get(key)
+            if source is None or not isinstance(source.get("source_bytes"), bytes):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Account-bound TOS references cannot be reused after account switching; provide source bytes.",
+                )
+            uploaded = await client.upload_image(
+                image_bytes=source["source_bytes"],
+                filename=source.get("filename") or "ref_image.png",
+            )
+            new_key = uploaded.get("uri", "")
+            _register_account_resource(client, new_key)
+            replacements[key] = new_key
+            source["uri"] = new_key
+        return [replacements.get(key, key) for key in image_keys]
+
+    async def _resolve_image_to_key(
+        client: BrowserClient,
+        image_input: Any,
+        *,
+        sources: Optional[list[dict[str, Any]]] = None,
+    ) -> str:
         """Resolve TOS key, data URI, base64 string, or remote HTTP URL to a ByteDance TOS key."""
         import base64
         import mimetypes
@@ -729,6 +821,8 @@ def create_app(
 
         # 1. Already a TOS key
         if image_str.startswith("tos-"):
+            if sources is not None:
+                sources.append({"uri": image_str, "source_bytes": None, "filename": "ref_image.png"})
             return image_str
 
         # 2. Data URI
@@ -744,7 +838,11 @@ def create_app(
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=f"Invalid image data URI: {exc}") from exc
             uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
-            return uploaded.get("uri", "")
+            key = uploaded.get("uri", "")
+            if sources is not None and key:
+                sources.append({"uri": key, "source_bytes": image_bytes, "filename": filename})
+            _register_account_resource(client, key)
+            return key
 
         # 3. HTTP or HTTPS URL
         if image_str.startswith("http://") or image_str.startswith("https://"):
@@ -780,20 +878,33 @@ def create_app(
                 raise HTTPException(status_code=502, detail=f"Failed to fetch remote image: {exc}")
 
             uploaded = await client.upload_image(image_bytes=image_bytes, filename=filename)
-            return uploaded.get("uri", "")
+            key = uploaded.get("uri", "")
+            if sources is not None and key:
+                sources.append({"uri": key, "source_bytes": image_bytes, "filename": filename})
+            _register_account_resource(client, key)
+            return key
 
         # 4. Raw base64 string (without data: prefix)
         try:
             image_bytes = base64.b64decode(image_str)
             if len(image_bytes) > 0:
                 uploaded = await client.upload_image(image_bytes=image_bytes, filename="ref_image.png")
-                return uploaded.get("uri", "")
+                key = uploaded.get("uri", "")
+                if sources is not None and key:
+                    sources.append({"uri": key, "source_bytes": image_bytes, "filename": "ref_image.png"})
+                _register_account_resource(client, key)
+                return key
         except Exception:
             pass
 
         raise HTTPException(status_code=400, detail=f"Unsupported image format: {image_str[:80]}")
 
-    async def _resolve_multi_images_to_keys(client: Any, image_inputs: List[Any]) -> List[str]:
+    async def _resolve_multi_images_to_keys(
+        client: Any,
+        image_inputs: List[Any],
+        *,
+        sources: Optional[list[dict[str, Any]]] = None,
+    ) -> List[str]:
         """Resolve a list of image inputs (files, TOS keys, Data URIs, URLs, or dicts) to TOS keys."""
         keys = []
         for item in image_inputs:
@@ -804,10 +915,13 @@ def create_app(
                 filename = getattr(item, "filename", "ref_image.png") or "ref_image.png"
                 uploaded = await client.upload_image(image_bytes=file_bytes, filename=filename)
                 key = uploaded.get("uri", "")
+                if sources is not None and key:
+                    sources.append({"uri": key, "source_bytes": file_bytes, "filename": filename})
+                _register_account_resource(client, key)
                 if key and key not in keys:
                     keys.append(key)
             elif isinstance(item, (str, dict)):
-                key = await _resolve_image_to_key(client, item)
+                key = await _resolve_image_to_key(client, item, sources=sources)
                 if key and key not in keys:
                     keys.append(key)
         return keys
@@ -941,6 +1055,7 @@ def create_app(
         *,
         allow_account_switch: bool,
         record_failure: bool = True,
+        feature: str = "chat",
     ) -> Optional[str]:
         """Resolve a verification error without clearing it before a successful request."""
         code = int(error.code) if error.code and error.code.isdigit() else 0
@@ -961,11 +1076,14 @@ def create_app(
             except Exception as exc:
                 log.warning("Captcha auto-solver failed (%s)", type(exc).__name__)
 
-        manager = client.account_manager
+        manager = client.account_manager if isinstance(client.account_manager, AccountManager) else None
         current_acc = manager.get_active_account() if manager else None
         if manager and current_acc:
             manager.mark_captcha_required(current_acc.id)
-        next_acc = manager.get_next_available_account() if manager and allow_account_switch else None
+        next_acc = (
+            manager.get_next_available_account(feature)
+            if manager and allow_account_switch else None
+        )
         if next_acc and (not current_acc or next_acc.id != current_acc.id):
             try:
                 switched = await client.switch_to_account(next_acc.id)
@@ -986,10 +1104,11 @@ def create_app(
         request: Request,
         *,
         allow_account_switch: bool,
-    ) -> None:
+        feature: str = "chat",
+    ) -> Optional[str]:
         """Try explicit verification recovery; let a real request prove hidden recovery."""
         if not client.needs_captcha:
-            return
+            return None
 
         safe_code = str(client.last_error_code) if str(client.last_error_code).isdigit() else None
         error = UpstreamError(
@@ -999,18 +1118,127 @@ def create_app(
         )
         recovered = await _recover_upstream_error(
             client, error, _admin_url(request), allow_account_switch=allow_account_switch,
-            record_failure=False,
+            record_failure=False, feature=feature,
         )
         if recovered:
-            return
+            manager = getattr(client, "account_manager", None)
+            active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+            return active.id if active else None
 
         # A missing DOM challenge cannot prove recovery. A hidden challenge also
         # gets one actual upstream request, whose success clears this state.
         if not await client.is_captcha_visible():
-            return
+            manager = getattr(client, "account_manager", None)
+            active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+            return active.id if active else None
 
         await client.auto_popup_for_captcha()
         raise UpstreamAPIError(error)
+
+    async def _select_account_for_request(
+        client: BrowserClient,
+        feature: str,
+        *,
+        conversation_id: Optional[str] = None,
+        account_bound_inputs: bool = False,
+        preferred_account_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Choose one account for a new operation, committing only after a real switch."""
+        manager = getattr(client, "account_manager", None)
+        if not isinstance(manager, AccountManager) or not manager.accounts:
+            return None
+
+        active = manager.get_active_account()
+        if conversation_id:
+            owner_id = _conversation_account_ids.get(conversation_id)
+            if owner_id:
+                if not active or active.id != owner_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This conversation belongs to a different account. Switch to its owner account to continue.",
+                    )
+                owner = manager.get_account(owner_id)
+                if owner is None or owner.status in ("disabled", "invalid"):
+                    raise HTTPException(status_code=409, detail="The account bound to this conversation is unavailable.")
+                if owner.status == "captcha" and not client.needs_captcha:
+                    raise HTTPException(status_code=409, detail="The account bound to this conversation requires verification.")
+                return owner_id
+            if active:
+                if active.status in ("disabled", "invalid") or (
+                    active.status == "captcha" and not client.needs_captcha
+                ):
+                    raise HTTPException(status_code=409, detail="The current account is unavailable for this conversation.")
+                return active.id
+            raise HTTPException(status_code=409, detail="No active account is available to pin this conversation.")
+
+        if preferred_account_id:
+            preferred = manager.get_account(preferred_account_id)
+            probe_current = (
+                preferred is not None
+                and preferred.status == "captcha"
+                and client.needs_captcha
+                and feature != "video"
+                and active is not None
+                and active.id == preferred_account_id
+            )
+            if preferred is None or (preferred not in manager.get_available_accounts(feature) and not probe_current):
+                raise HTTPException(status_code=503, detail=f"Recovered account is unavailable for {feature} requests.")
+            if not active or active.id != preferred_account_id:
+                raise HTTPException(status_code=503, detail="Recovered account changed before request dispatch.")
+            return preferred_account_id
+
+        candidate = manager.get_next_available_account(feature)
+        if candidate is None:
+            status_code = 429 if feature == "video" else 503
+            raise HTTPException(status_code=status_code, detail=f"No available account for {feature} requests.")
+
+        if account_bound_inputs:
+            if not active or candidate.id != active.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Account-bound reference data cannot be reused after account rotation. Provide source image or file bytes.",
+                )
+
+        if active and candidate.id == active.id:
+            manager.set_active_account(candidate.id)
+            return candidate.id
+
+        if not await client.switch_to_account(candidate.id):
+            raise HTTPException(status_code=503, detail="Failed to switch to the selected account.")
+        return candidate.id
+
+    def _bind_conversation_account(conversation_id: Optional[str], account_id: Optional[str]) -> None:
+        if conversation_id and account_id:
+            _conversation_account_ids[conversation_id] = account_id
+
+    def _register_account_resource(client: Any, uri: str) -> None:
+        manager = getattr(client, "account_manager", None)
+        active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+        if uri and active:
+            _resource_account_ids[uri] = active.id
+
+    def _check_account_bound_resources(client: Any, resource_ids: list[str]) -> None:
+        manager = getattr(client, "account_manager", None)
+        active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+        if active is None:
+            return
+        for resource_id in resource_ids:
+            owner_id = _resource_account_ids.get(resource_id)
+            if owner_id and owner_id != active.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This TOS reference belongs to another account. Switch to its owner before using it.",
+                )
+
+    def _tos_resource_id(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            value = (
+                value.get("url") or value.get("image_url") or value.get("file_url")
+                or value.get("key") or value.get("uri") or ""
+            )
+        if isinstance(value, str) and value.strip().startswith("tos-"):
+            return value.strip()
+        return None
 
     @app.get("/v1/models")
     async def list_models(request: Request):
@@ -1059,10 +1287,26 @@ def create_app(
 
         await bucket.acquire()
         client = _get_client()
+        bound_resource_ids = [
+            key for ref in image_refs + file_refs
+            if (key := _tos_resource_id(ref)) is not None
+        ]
+        _check_account_bound_resources(client, bound_resource_ids)
+        account_bound_inputs = bool(bound_resource_ids)
 
         # ── 3-Tier Captcha Defense & Account Failover ──
-        await _resolve_captcha_or_failover(
-            client, request, allow_account_switch=not bool(body.conversation_id)
+        recovered_account_id = await _resolve_captcha_or_failover(
+            client,
+            request,
+            allow_account_switch=not bool(body.conversation_id) and not account_bound_inputs,
+            feature="chat",
+        )
+        account_id = await _select_account_for_request(
+            client,
+            "chat",
+            conversation_id=body.conversation_id,
+            account_bound_inputs=account_bound_inputs,
+            preferred_account_id=recovered_account_id,
         )
 
         # ── Request Dispatch Smoothing (anti-burst rate limit) ──
@@ -1101,6 +1345,10 @@ def create_app(
                              messages_for_counting=body.messages,
                              auto_delete=auto_delete,
                              admin_url=_admin_url(request),
+                             allow_account_switch=(
+                                 not bool(body.conversation_id)
+                                 and _attachments_reuploadable(image_attachments, file_attachments)
+                             ),
                              image_attachments=image_attachments,
                              file_attachments=file_attachments),
                 media_type="text/event-stream",
@@ -1115,7 +1363,10 @@ def create_app(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                     admin_url=_admin_url(request),
-                    allow_account_switch=not bool(body.conversation_id),
+                    allow_account_switch=(
+                        not bool(body.conversation_id)
+                        and _attachments_reuploadable(image_attachments, file_attachments)
+                    ),
                     image_attachments=image_attachments,
                     file_attachments=file_attachments,
                 )
@@ -1140,7 +1391,10 @@ def create_app(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
                     admin_url=_admin_url(request),
-                    allow_account_switch=not bool(body.conversation_id),
+                    allow_account_switch=(
+                        not bool(body.conversation_id)
+                        and _attachments_reuploadable(image_attachments, file_attachments)
+                    ),
                     image_attachments=image_attachments,
                     file_attachments=file_attachments,
                 )
@@ -1153,6 +1407,11 @@ def create_app(
         except RuntimeError:
             error = parse_upstream_error(None)
             return JSONResponse(error.to_openai_error(_admin_url(request)), status_code=error.status_code)
+
+        account_manager = getattr(client, "account_manager", None)
+        active_account = account_manager.get_active_account() if isinstance(account_manager, AccountManager) else None
+        if active_account:
+            account_id = active_account.id
 
         # max_tokens truncation (non-streaming only)
         content = message.get("content") or ""
@@ -1169,6 +1428,7 @@ def create_app(
         completion_content = message.get("content") or ""
         reasoning_content = message.get("reasoning_content") or ""
         completion_tokens = count_tokens(completion_content + reasoning_content)
+        _bind_conversation_account(message.get("conversation_id"), account_id)
 
         resp_data = {
             "id": request_id,
@@ -1191,7 +1451,9 @@ def create_app(
 
         # Auto-delete ephemeral conversation in background (即用即焚 / Scheme B)
         if auto_delete and message.get("conversation_id"):
-            asyncio.create_task(_delayed_delete(client, message["conversation_id"]))
+            asyncio.create_task(
+                _delayed_delete(client, message["conversation_id"], owner_account_id=account_id)
+            )
 
         return JSONResponse(resp_data)
 
@@ -1200,7 +1462,6 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
-        await _resolve_captcha_or_failover(client, request, allow_account_switch=True)
 
         ratio = body.ratio or _size_to_ratio(body.size)
         ref_image_keys = []
@@ -1215,6 +1476,22 @@ def create_app(
                 img_inputs.extend(val)
             elif val:
                 img_inputs.append(val)
+
+        bound_resource_ids = [
+            key for item in ref_image_keys + img_inputs
+            if (key := _tos_resource_id(item)) is not None
+        ]
+        _check_account_bound_resources(client, bound_resource_ids)
+        account_bound_inputs = bool(bound_resource_ids)
+        recovered_account_id = await _resolve_captcha_or_failover(
+            client, request,
+            allow_account_switch=not account_bound_inputs,
+            feature="image",
+        )
+        await _select_account_for_request(
+            client, "image", account_bound_inputs=account_bound_inputs,
+            preferred_account_id=recovered_account_id,
+        )
 
         if img_inputs:
             uploaded_keys = await _resolve_multi_images_to_keys(client, img_inputs)
@@ -1274,7 +1551,6 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
-        await _resolve_captcha_or_failover(client, request, allow_account_switch=True)
 
         content_type = request.headers.get("content-type", "")
         prompt = ""
@@ -1286,6 +1562,8 @@ def create_app(
         memory_type = None
 
         ref_image_keys = []
+        image_items = []
+        image_sources: list[dict[str, Any]] = []
         if "multipart/form-data" in content_type:
             form = await request.form()
             prompt = str(form.get("prompt", "")).strip()
@@ -1305,16 +1583,10 @@ def create_app(
                     memory_type = int(form.get("memory_type"))
                 except ValueError:
                     pass
-            file_items = []
             for field_name in ("images", "image", "files", "file"):
                 for it in form.getlist(field_name):
-                    if it and it not in file_items:
-                        file_items.append(it)
-            if file_items:
-                uploaded_keys = await _resolve_multi_images_to_keys(client, file_items)
-                for uk in uploaded_keys:
-                    if uk not in ref_image_keys:
-                        ref_image_keys.append(uk)
+                    if it and it not in image_items:
+                        image_items.append(it)
         else:
             body = await request.json()
             prompt = str(body.get("prompt", "")).strip()
@@ -1338,21 +1610,35 @@ def create_app(
                     memory_type = int(body.get("memory_type"))
                 except ValueError:
                     pass
-            img_items = []
             for field_name in ("images", "image_urls", "ref_images", "image", "image_url", "ref_image"):
                 val = body.get(field_name)
                 if isinstance(val, list):
-                    img_items.extend(val)
+                    image_items.extend(val)
                 elif val:
-                    img_items.append(val)
-            if img_items:
-                uploaded_keys = await _resolve_multi_images_to_keys(client, img_items)
-                for uk in uploaded_keys:
-                    if uk not in ref_image_keys:
-                        ref_image_keys.append(uk)
+                    image_items.append(val)
 
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
+        bound_resource_ids = [
+            key for item in ref_image_keys + image_items
+            if (key := _tos_resource_id(item)) is not None
+        ]
+        _check_account_bound_resources(client, bound_resource_ids)
+        account_bound_inputs = bool(bound_resource_ids)
+        recovered_account_id = await _resolve_captcha_or_failover(
+            client, request,
+            allow_account_switch=not account_bound_inputs,
+            feature="image",
+        )
+        await _select_account_for_request(
+            client, "image", account_bound_inputs=account_bound_inputs,
+            preferred_account_id=recovered_account_id,
+        )
+        if image_items:
+            uploaded_keys = await _resolve_multi_images_to_keys(client, image_items, sources=image_sources)
+            for uk in uploaded_keys:
+                if uk not in ref_image_keys:
+                    ref_image_keys.append(uk)
         if not ref_image_keys:
             raise HTTPException(status_code=400, detail="Missing reference image (image or ref_image_key)")
 
@@ -1453,7 +1739,6 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
-        await _resolve_captcha_or_failover(client, request, allow_account_switch=True)
 
         content_type = request.headers.get("content-type", "")
         prompt = ""
@@ -1464,6 +1749,8 @@ def create_app(
         memory_type = None
 
         ref_image_keys = []
+        image_items = []
+        image_sources: list[dict[str, Any]] = []
         if "multipart/form-data" in content_type:
             form = await request.form()
             prompt = str(form.get("prompt", "")).strip()
@@ -1482,16 +1769,10 @@ def create_app(
                     memory_type = int(form.get("memory_type"))
                 except ValueError:
                     pass
-            file_items = []
             for field_name in ("images", "image", "files", "file"):
                 for it in form.getlist(field_name):
-                    if it and it not in file_items:
-                        file_items.append(it)
-            if file_items:
-                uploaded_keys = await _resolve_multi_images_to_keys(client, file_items)
-                for uk in uploaded_keys:
-                    if uk not in ref_image_keys:
-                        ref_image_keys.append(uk)
+                    if it and it not in image_items:
+                        image_items.append(it)
         else:
             body = await request.json()
             prompt = str(body.get("prompt", "")).strip()
@@ -1514,48 +1795,107 @@ def create_app(
                     memory_type = int(body.get("memory_type"))
                 except ValueError:
                     pass
-            img_items = []
             for field_name in ("images", "image_urls", "ref_images", "image", "image_url", "ref_image"):
                 val = body.get(field_name)
                 if isinstance(val, list):
-                    img_items.extend(val)
+                    image_items.extend(val)
                 elif val:
-                    img_items.append(val)
-            if img_items:
-                uploaded_keys = await _resolve_multi_images_to_keys(client, img_items)
-                for uk in uploaded_keys:
-                    if uk not in ref_image_keys:
-                        ref_image_keys.append(uk)
+                    image_items.append(val)
 
         if not prompt:
             raise HTTPException(status_code=400, detail="Missing prompt")
+
+        bound_resource_ids = [
+            key for item in ref_image_keys + image_items
+            if (key := _tos_resource_id(item)) is not None
+        ]
+        _check_account_bound_resources(client, bound_resource_ids)
+        account_bound_inputs = bool(bound_resource_ids)
+        recovered_account_id = await _resolve_captcha_or_failover(
+            client, request,
+            allow_account_switch=not account_bound_inputs,
+            feature="video",
+        )
+        await _select_account_for_request(
+            client, "video", account_bound_inputs=account_bound_inputs,
+            preferred_account_id=recovered_account_id,
+        )
+        if image_items:
+            uploaded_keys = await _resolve_multi_images_to_keys(client, image_items, sources=image_sources)
+            for uk in uploaded_keys:
+                if uk not in ref_image_keys:
+                    ref_image_keys.append(uk)
 
         if ratio and "x" in str(ratio):
             ratio = _size_to_ratio(ratio)
 
         ref_image_key = ref_image_keys[0] if ref_image_keys else None
 
-        gen_kwargs = {}
-        if len(ref_image_keys) > 1:
-            gen_kwargs["ref_image_keys"] = ref_image_keys
-
+        history_kwargs = {}
         header_save = request.headers.get("x-save-history", "").lower() in ("true", "1", "yes")
         header_no_del = request.headers.get("x-auto-delete", "").lower() in ("false", "0", "no")
         if memory_type is not None:
-            gen_kwargs["memory_type"] = memory_type
+            history_kwargs["memory_type"] = memory_type
         elif save_history is not None:
-            gen_kwargs["save_history"] = save_history
+            history_kwargs["save_history"] = save_history
         elif header_save or header_no_del:
-            gen_kwargs["save_history"] = True
+            history_kwargs["save_history"] = True
         elif not _auto_delete_conv:
-            gen_kwargs["memory_type"] = 0
+            history_kwargs["memory_type"] = 0
 
-        try:
-            result = await client.generate_video(
-                prompt=prompt, ratio=ratio, ref_image_key=ref_image_key, **gen_kwargs
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+        manager = getattr(client, "account_manager", None)
+        attempted_account_ids: set[str] = set()
+        while True:
+            active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+            if active:
+                attempted_account_ids.add(active.id)
+            call_kwargs = dict(history_kwargs)
+            if len(ref_image_keys) > 1:
+                call_kwargs["ref_image_keys"] = list(ref_image_keys)
+            try:
+                result = await client.generate_video(
+                    prompt=prompt,
+                    ratio=ratio,
+                    ref_image_key=ref_image_key,
+                    **call_kwargs,
+                )
+                break
+            except VideoQuotaExceeded:
+                if not isinstance(manager, AccountManager):
+                    raise HTTPException(status_code=429, detail="Video generation quota exceeded.")
+                candidate = manager.get_next_available_account(
+                    "video", exclude_ids=attempted_account_ids
+                )
+                if candidate is None:
+                    raise HTTPException(status_code=429, detail="Video quota is exhausted for all available accounts.")
+                source_by_key = {source["uri"]: source for source in image_sources}
+                if any(
+                    key not in source_by_key
+                    or not isinstance(source_by_key[key].get("source_bytes"), bytes)
+                    for key in ref_image_keys
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Video quota failover cannot reuse account-bound TOS references; provide source image bytes.",
+                    )
+                while candidate is not None:
+                    attempted_account_ids.add(candidate.id)
+                    try:
+                        switched = await client.switch_to_account(candidate.id)
+                    except Exception as exc:
+                        log.warning("Video quota failover switch failed (%s)", type(exc).__name__)
+                        switched = False
+                    if switched:
+                        break
+                    candidate = manager.get_next_available_account(
+                        "video", exclude_ids=attempted_account_ids
+                    )
+                if candidate is None:
+                    raise HTTPException(status_code=429, detail="Video quota is exhausted for all available accounts.")
+                ref_image_keys = await _reupload_image_sources(client, ref_image_keys, image_sources)
+                ref_image_key = ref_image_keys[0] if ref_image_keys else None
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
 
         videos = result.get("videos", [])
         msg = result.get("message", "")
@@ -1608,6 +1948,7 @@ def create_app(
             result = await client.upload_file(file_data, filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        _register_account_resource(client, result["uri"])
 
         return JSONResponse({
             "id": result["uri"],
@@ -1625,6 +1966,7 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
+        _check_account_bound_resources(client, [uri] if _tos_resource_id(uri) else [])
         try:
             url = await client.get_file_download_url(uri=uri, expire_seconds=expire)
         except RuntimeError as exc:
@@ -1657,6 +1999,7 @@ def create_app(
             result = await client.upload_image(image_bytes=image_data, filename=filename)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        _register_account_resource(client, result.get("uri", ""))
         return JSONResponse({
             "uri": result["uri"],
             "cdn_url": result["cdn_url"],
@@ -1685,6 +2028,14 @@ def create_app(
             raise HTTPException(status_code=400, detail="Missing file_id or prompt")
 
         use_deep_think = CHAT_MODELS.get(model, 0)
+        _check_account_bound_resources(client, [file_id] if _tos_resource_id(file_id) else [])
+        recovered_account_id = await _resolve_captcha_or_failover(
+            client, request, allow_account_switch=False, feature="chat"
+        )
+        await _select_account_for_request(
+            client, "chat", account_bound_inputs=True,
+            preferred_account_id=recovered_account_id,
+        )
 
         try:
             result = await client.chat_with_file(
@@ -1711,14 +2062,31 @@ def create_app(
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
-    async def _delayed_delete(client: BrowserClient, conversation_id: str, delay: float = 0.8):
+    async def _delayed_delete(
+        client: BrowserClient,
+        conversation_id: str,
+        delay: float = 0.8,
+        *,
+        owner_account_id: Optional[str] = None,
+    ):
         """Asynchronously delete ephemeral conversation in background (即用即焚)."""
         try:
             if delay > 0:
                 await asyncio.sleep(delay)
-            await client.delete_conversation(conversation_id)
+            manager = getattr(client, "account_manager", None)
+            gate = getattr(client, "operation_gate", None)
+            if isinstance(gate, BrowserOperationGate):
+                async with gate.fresh_lease():
+                    active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+                    if owner_account_id and (not active or active.id != owner_account_id):
+                        return
+                    deleted = await client.delete_conversation(conversation_id)
+            else:
+                deleted = await client.delete_conversation(conversation_id)
+            if deleted:
+                _conversation_account_ids.pop(conversation_id, None)
         except Exception as exc:
-            log.warning("Delayed delete failed for %s: %s", conversation_id, exc)
+            log.warning("Delayed delete failed (%s)", type(exc).__name__)
 
     async def _collect_chat_response(
         client: BrowserClient,
@@ -1745,6 +2113,9 @@ def create_app(
         content_parts: list = []
         result_conversation_id: Optional[str] = None
         saw_upstream_output = False
+        manager = getattr(client, "account_manager", None)
+        initial_account = manager.get_active_account() if isinstance(manager, AccountManager) else None
+        initial_account_id = initial_account.id if initial_account else None
 
         def _iter_blocks(data: dict):
             for patch in data.get("patch_op", []):
@@ -1782,12 +2153,16 @@ def create_app(
                     error,
                     admin_url or "",
                     allow_account_switch=allow_account_switch and can_attempt_retry,
+                    feature="chat",
                 )
                 can_retry = (
                     can_attempt_retry
                     and (not conversation_id or recovered != "account_switch")
                 )
                 if recovered and can_retry:
+                    active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+                    if active and active.id != initial_account_id:
+                        await _reupload_chat_attachments(client, image_attachments, file_attachments)
                     return await _collect_chat_response(
                         client,
                         prompt,
@@ -1882,6 +2257,7 @@ def create_app(
         image_attachments: Optional[list[dict[str, Any]]] = None,
         file_attachments: Optional[list[dict[str, Any]]] = None,
         admin_url: Optional[str] = None,
+        allow_account_switch: bool = True,
         _retry_count: int = 0,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
@@ -1972,7 +2348,8 @@ def create_app(
                         client,
                         error,
                         admin_url or "",
-                        allow_account_switch=not bool(conversation_id) and can_attempt_retry,
+                        allow_account_switch=allow_account_switch and can_attempt_retry,
+                        feature="chat",
                     )
                     can_retry = (
                         recovered is not None
@@ -1980,6 +2357,13 @@ def create_app(
                         and (not conversation_id or recovered != "account_switch")
                     )
                     if can_retry:
+                        manager = getattr(client, "account_manager", None)
+                        active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+                        initial = _conversation_account_ids.get(conversation_id or "")
+                        if active and initial and active.id != initial:
+                            await _reupload_chat_attachments(client, image_attachments, file_attachments)
+                        elif active and not conversation_id and recovered == "account_switch":
+                            await _reupload_chat_attachments(client, image_attachments, file_attachments)
                         async for frame in _stream_chat(
                             client,
                             prompt,
@@ -1994,6 +2378,7 @@ def create_app(
                             image_attachments=image_attachments,
                             file_attachments=file_attachments,
                             admin_url=admin_url,
+                            allow_account_switch=allow_account_switch,
                             _retry_count=_retry_count + 1,
                         ):
                             yield frame
@@ -2257,6 +2642,9 @@ def create_app(
 
         # Final chunk with usage
         client.record_success()
+        manager = getattr(client, "account_manager", None)
+        active = manager.get_active_account() if isinstance(manager, AccountManager) else None
+        _bind_conversation_account(result_conversation_id, active.id if active else None)
         # Report to expert tracker for degradation detection
         if has_tools and use_deep_think >= 1:
             _expert_tracker.report_response(had_reasoning_content)
@@ -2283,7 +2671,13 @@ def create_app(
 
         # Ephemeral conversation auto-delete (Scheme B: 即用即焚)
         if auto_delete and result_conversation_id:
-            asyncio.create_task(_delayed_delete(client, result_conversation_id))
+            asyncio.create_task(
+                _delayed_delete(
+                    client,
+                    result_conversation_id,
+                    owner_account_id=active.id if active else None,
+                )
+            )
 
     # ── Admin Dashboard & Auth ──
 
@@ -2660,9 +3054,10 @@ def create_app(
                         else:
                             err = str(e)
 
-                status = "active" if is_valid else "invalid"
-                if acc.video_quota_exceeded:
-                    status = "quota_exceeded"
+                if acc.status in ("disabled", "captcha", "quota_exceeded"):
+                    status = acc.status
+                else:
+                    status = "active" if is_valid else "invalid"
                 am.update_account_status(acc.id, status)
                 results.append({
                     "id": acc.id,
@@ -2744,7 +3139,11 @@ def create_app(
             return {"status": "already_logged_in"}
 
         # Start login (non-blocking, returns immediately)
-        asyncio.create_task(_do_login(client))
+        gate = getattr(client, "operation_gate", None)
+        if isinstance(gate, BrowserOperationGate):
+            gate.spawn_detached(_do_login(client))
+        else:
+            asyncio.create_task(_do_login(client))
         return {"status": "login_started", "message": "QR code displayed in browser. Scan to login."}
     @app.post("/auth/reset_captcha")
     async def reset_captcha(request: Request):
@@ -2769,6 +3168,7 @@ def create_app(
                 log.warning("QR login timed out")
         except Exception as exc:
             log.error("QR login error: %s", exc)
+
 
     @app.get("/auth/status")
     async def auth_status(request: Request):

@@ -13,17 +13,20 @@ and call this signing function. All actual API traffic goes through httpx.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
 import time
 import uuid
+from functools import wraps
 from typing import AsyncGenerator, Optional, Dict, Any, List, Union
 from urllib.parse import urlencode
 
 import httpx
 from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
+from .browser_operation import BrowserOperationGate
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +35,32 @@ CHAT_URL = f"{DOUBAO_URL}/chat/"
 COMPLETION_URL = f"{DOUBAO_URL}/chat/completion"
 SAMANTHA_COMPLETION_URL = f"{DOUBAO_URL}/samantha/chat/completion"
 DEFAULT_BOT_ID = "7338286299411103781"
+
+
+class VideoQuotaExceeded(RuntimeError):
+    """The active account has reached its daily video generation quota."""
+
+
+def _serialized_browser_operation(method):
+    if inspect.isasyncgenfunction(method):
+        @wraps(method)
+        async def _stream(self, *args, **kwargs):
+            async with self.operation_gate.lease():
+                iterator = method(self, *args, **kwargs).__aiter__()
+                try:
+                    async for item in iterator:
+                        yield item
+                finally:
+                    close = getattr(iterator, "aclose", None)
+                    if close:
+                        await close()
+        return _stream
+
+    @wraps(method)
+    async def _call(self, *args, **kwargs):
+        async with self.operation_gate.lease():
+            return await method(self, *args, **kwargs)
+    return _call
 
 
 def resolve_headless_mode(val: Optional[Union[bool, str]] = None) -> bool:
@@ -143,6 +172,7 @@ class BrowserClient:
     def __init__(self, headless: Optional[Union[bool, str]] = None, user_data_dir: Optional[str] = None):
         self._raw_headless = headless
         self.headless = resolve_headless_mode(headless)
+        self.operation_gate = BrowserOperationGate()
         self.user_data_dir = user_data_dir
         self._playwright = None
         self._context: Optional[BrowserContext] = None
@@ -216,6 +246,7 @@ class BrowserClient:
         self._last_error_category = ""
         log.info("Captcha flag cleared")
 
+    @_serialized_browser_operation
     async def is_captcha_visible(self) -> bool:
         """Check whether a real captcha modal/slider/iframe is actually visible in the browser DOM."""
         if not self._page:
@@ -261,6 +292,7 @@ class BrowserClient:
         except Exception:
             return False
 
+    @_serialized_browser_operation
     async def auto_popup_for_captcha(self) -> bool:
         """If captcha is detected, ensure browser window is visible and brought to front."""
         can_display = (os.name == "nt") or bool(os.environ.get("DISPLAY"))
@@ -281,6 +313,7 @@ class BrowserClient:
                 pass
         return True
 
+    @_serialized_browser_operation
     async def try_auto_solve_captcha(self) -> bool:
         """Attempt to automatically detect and solve slider captcha.
 
@@ -444,6 +477,7 @@ class BrowserClient:
 
         return candidates
 
+    @_serialized_browser_operation
     async def start(self):
         """Launch browser window or headless instance, navigate to Doubao, init httpx client."""
         self.headless = resolve_headless_mode(self._raw_headless)
@@ -603,8 +637,9 @@ class BrowserClient:
 
         await self._check_login_state()
         if not self._ready and not self.headless:
-            asyncio.create_task(self._trigger_login_dialog())
+            self.operation_gate.spawn_detached(self._trigger_login_dialog())
 
+    @_serialized_browser_operation
     async def stop(self):
         """Close browser and httpx client."""
         if self._http:
@@ -636,6 +671,7 @@ class BrowserClient:
                         pass
         log.info("BrowserClient stopped")
 
+    @_serialized_browser_operation
     async def is_alive(self) -> bool:
         """Check if browser process is still responsive."""
         if not self._page or not self._context:
@@ -651,6 +687,7 @@ class BrowserClient:
             log.warning("Browser health check failed: %s", e)
             return False
 
+    @_serialized_browser_operation
     async def restart(self):
         """Stop and restart the browser client."""
         log.info("Restarting BrowserClient...")
@@ -659,6 +696,7 @@ class BrowserClient:
         await self.start()
         log.info("BrowserClient restarted. ready=%s", self._ready)
 
+    @_serialized_browser_operation
     async def switch_mode(self, headless: Optional[Union[bool, str]] = None) -> bool:
         """Ensure browser window is active, healthy, and optionally adjust headless mode."""
         if headless is not None:
@@ -699,6 +737,7 @@ class BrowserClient:
     # Login
     # ------------------------------------------------------------------
 
+    @_serialized_browser_operation
     async def _check_login_state(self):
         """Check if logged in by inspecting session cookies and page DOM."""
         if self._page and "from_logout=1" in self._page.url:
@@ -785,22 +824,23 @@ class BrowserClient:
     async def _extract_params(self):
         """Extract device_id, web_id, fp from localStorage/cookies."""
         for _ in range(5):
-            params = await self._page.evaluate("""() => {
-                const result = {};
-                try {
-                    const samWeb = JSON.parse(localStorage.getItem('samantha_web_web_id') || '{}');
-                    result.device_id = samWeb.web_id || '';
-                } catch(e) {}
-                try {
-                    const tea = JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}');
-                    result.web_id = tea.web_id || '';
-                } catch(e) {}
-                const fpCookie = document.cookie.split(';')
-                    .map(c => c.trim())
-                    .find(c => c.startsWith('s_v_web_id='));
-                result.fp = fpCookie ? fpCookie.split('=')[1] : '';
-                return result;
-            }""")
+            async with self.operation_gate.lease():
+                params = await self._page.evaluate("""() => {
+                    const result = {};
+                    try {
+                        const samWeb = JSON.parse(localStorage.getItem('samantha_web_web_id') || '{}');
+                        result.device_id = samWeb.web_id || '';
+                    } catch(e) {}
+                    try {
+                        const tea = JSON.parse(localStorage.getItem('__tea_cache_tokens_497858') || '{}');
+                        result.web_id = tea.web_id || '';
+                    } catch(e) {}
+                    const fpCookie = document.cookie.split(';')
+                        .map(c => c.trim())
+                        .find(c => c.startsWith('s_v_web_id='));
+                    result.fp = fpCookie ? fpCookie.split('=')[1] : '';
+                    return result;
+                }""")
             self._device_id = params.get("device_id", "")
             self._web_id = params.get("web_id", "")
             self._fp = params.get("fp", "")
@@ -813,15 +853,17 @@ class BrowserClient:
     async def _wait_for_signing(self):
         """Wait for bdms.frontierSign to become available (legacy, kept for upload signing)."""
         for i in range(12):  # up to 60s
-            has_sign = await self._page.evaluate(
-                "() => typeof window.bdms?.frontierSign === 'function'"
-            )
+            async with self.operation_gate.lease():
+                has_sign = await self._page.evaluate(
+                    "() => typeof window.bdms?.frontierSign === 'function'"
+                )
             if has_sign:
                 log.info("bdms.frontierSign available after %ds", (i + 1) * 5)
                 return
             await asyncio.sleep(5)
         log.warning("bdms.frontierSign not available after 60s - signing may fail")
 
+    @_serialized_browser_operation
     async def _setup_fetch_bridge(self):
         """Register expose_function callback for streaming data from browser to Python."""
         if self._bridge_ready:
@@ -849,12 +891,13 @@ class BrowserClient:
     async def _verify_fetch_hook(self):
         """Verify ByteDance's fetch interceptor is active (adds a_bogus)."""
         for i in range(15):  # up to 30s
-            hooked = await self._page.evaluate("""() => {
-                try {
-                    const s = window.fetch.toString();
-                    return !s.includes('native code');
-                } catch(e) { return false; }
-            }""")
+            async with self.operation_gate.lease():
+                hooked = await self._page.evaluate("""() => {
+                    try {
+                        const s = window.fetch.toString();
+                        return !s.includes('native code');
+                    } catch(e) { return false; }
+                }""")
             if hooked:
                 log.info("Fetch hook verified active after %ds", (i + 1) * 2)
                 return True
@@ -869,22 +912,25 @@ class BrowserClient:
         try:
             for _ in range(timeout):
                 await asyncio.sleep(1)
-                avatar = self._page.locator('img[class*="avatar"], div[class*="avatar"], span:has-text("套餐"), div:has-text("套餐")')
-                if await avatar.count() > 0:
+                async with self.operation_gate.lease():
+                    avatar = self._page.locator('img[class*="avatar"], div[class*="avatar"], span:has-text("套餐"), div:has-text("套餐")')
+                    has_avatar = await avatar.count() > 0
+                    login_btn = self._page.locator('button:has-text("登录")')
+                    has_login_button = await login_btn.count() > 0
+                if has_avatar:
                     log.info("Detected user profile/avatar in DOM!")
                     break
-                login_btn = self._page.locator('button:has-text("登录")')
-                if await login_btn.count() == 0:
+                if not has_login_button:
                     log.info("Login button no longer visible!")
                     break
 
             await asyncio.sleep(2)
-            self._ready = True
             await self._extract_params()
             await self._seed_ms_token()
             await self._setup_fetch_bridge()
             await self._verify_fetch_hook()
             await self._wait_for_signing()
+            self._ready = True
             log.info("Login successful and client ready!")
             return True
         except Exception as e:
@@ -895,16 +941,18 @@ class BrowserClient:
         """Click login button to show QR code dialog."""
         for _ in range(10):
             try:
-                btn = self._page.locator('button:has-text("登录")')
-                if await btn.count() > 0:
-                    await btn.first.click()
-                    log.info("Clicked '登录' button to display QR code dialog")
-                    return
+                async with self.operation_gate.lease():
+                    btn = self._page.locator('button:has-text("登录")')
+                    if await btn.count() > 0:
+                        await btn.first.click()
+                        log.info("Clicked '登录' button to display QR code dialog")
+                        return
             except Exception:
                 pass
             await asyncio.sleep(1)
 
 
+    @_serialized_browser_operation
     async def inject_cookies_and_reload(self, cookies: Dict[str, str]) -> bool:
         """Inject cookies from QR login or user import into browser context and reload.
 
@@ -939,6 +987,7 @@ class BrowserClient:
         await self._check_login_state()
         return self._ready
 
+    @_serialized_browser_operation
     async def switch_to_account(self, account_id: str) -> bool:
         """Switch browser session to specified account from the account pool."""
         acc = self.account_manager.get_account(account_id)
@@ -949,33 +998,74 @@ class BrowserClient:
             log.error("switch_to_account: account %s has no cookies", account_id)
             return False
 
-        if not self._context or not self._page or not await self.is_alive():
-            log.info("switch_to_account: browser not active, restarting...")
-            await self.restart()
+        previous = self.account_manager.get_active_account()
+        previous_cookies = dict(previous.cookies) if previous else {}
+
+        try:
+            if not self._context or not self._page or not await self.is_alive():
+                log.info("switch_to_account: browser not active, restarting...")
+                await self.restart()
+        except asyncio.CancelledError:
+            self._ready = False
+            raise
+        except Exception as exc:
+            log.warning("Browser restart failed during account switch (%s)", type(exc).__name__)
+            self._ready = False
+            return False
 
         if not self._context or not self._page:
             return False
 
+        async def _restore_previous() -> bool:
+            if not previous_cookies or not self._context or not self._page:
+                return False
+            try:
+                await self._context.clear_cookies()
+                return await self.inject_cookies_and_reload(previous_cookies)
+            except Exception as exc:
+                log.warning("Failed to restore prior account after switch failure (%s)", type(exc).__name__)
+                return False
+
         # Clear existing cookies to avoid session cross-contamination
+        self._ready = False
         try:
             await self._context.clear_cookies()
-        except Exception as e:
-            log.warning("clear_cookies error before switch: %s", e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("clear_cookies failed before account switch (%s)", type(exc).__name__)
+            return False
 
-        ok = await self.inject_cookies_and_reload(acc.cookies)
+        try:
+            ok = await self.inject_cookies_and_reload(acc.cookies)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Account switch failed during cookie injection (%s)", type(exc).__name__)
+            ok = False
         if ok:
             self.account_manager.set_active_account(acc.id)
+            self._consecutive_failures = 0
+            self._last_error_code = 0
+            self._last_error_category = ""
+            self._needs_captcha = False
             log.info("Successfully switched to account %s (%s)", acc.id, acc.name)
-        return ok
+            return True
+
+        restored = await _restore_previous()
+        self._ready = restored
+        return False
     # ------------------------------------------------------------------
     # Signing & Cookies
     # ------------------------------------------------------------------
 
+    @_serialized_browser_operation
     async def _get_cookies_string(self) -> str:
         """Get full cookie string including httpOnly cookies."""
         cookies = await self._context.cookies("https://www.doubao.com")
         return "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
+    @_serialized_browser_operation
     async def _get_csrf_token(self) -> str:
         """Get passport_csrf_token from browser cookies."""
         cookies = await self._context.cookies("https://www.doubao.com")
@@ -986,6 +1076,7 @@ class BrowserClient:
                 return c["value"]
         return ""
 
+    @_serialized_browser_operation
     async def _seed_ms_token(self):
         """Seed initial msToken from browser cookies."""
         cookies = await self._context.cookies("https://www.doubao.com")
@@ -996,6 +1087,7 @@ class BrowserClient:
                 return
         log.warning("No msToken cookie found - first request may trigger rate limit")
 
+    @_serialized_browser_operation
     async def _sign_url(self, base_url: str, params: Dict[str, str]) -> str:
         """Sign a URL using bdms.frontierSign with retry on failure."""
         sorted_params = dict(sorted(params.items()))
@@ -1088,6 +1180,7 @@ class BrowserClient:
     # Chat Completion (streaming via in-browser fetch)
     # ------------------------------------------------------------------
 
+    @_serialized_browser_operation
     async def chat_completion(
         self,
         text: str,
@@ -1374,6 +1467,7 @@ class BrowserClient:
                 except Exception:
                     pass
 
+    @_serialized_browser_operation
     async def _browser_fetch_stream(
         self, url: str, payload: Dict[str, Any], request_id: str
     ):
@@ -1481,6 +1575,7 @@ class BrowserClient:
     # High-level chat helper
     # ------------------------------------------------------------------
 
+    @_serialized_browser_operation
     async def chat(
         self,
         text: str,
@@ -1561,6 +1656,7 @@ class BrowserClient:
             return meta["conversation_id"]
         return None
 
+    @_serialized_browser_operation
     async def delete_conversation(self, conversation_id: str) -> bool:
         """Delete a conversation from Doubao via /im/conversation/batch_del_user_conv.
 
@@ -1637,6 +1733,7 @@ class BrowserClient:
     # Samantha endpoint (image/video/music generation)
     # ------------------------------------------------------------------
 
+    @_serialized_browser_operation
     async def _samantha_request(
         self,
         payload: Dict[str, Any],
@@ -1731,6 +1828,7 @@ class BrowserClient:
                 continue
         return events
 
+    @_serialized_browser_operation
     async def generate_image(
         self,
         prompt: str,
@@ -1865,6 +1963,7 @@ class BrowserClient:
         log.info("generate_image: got %d images", len(images))
         return {"images": images, "prompt": prompt}
 
+    @_serialized_browser_operation
     async def generate_music(
         self,
         prompt: str,
@@ -2026,6 +2125,7 @@ class BrowserClient:
         log.info("generate_music: got %d tracks", len(tracks))
         return {"tracks": tracks, "prompt": prompt}
 
+    @_serialized_browser_operation
     async def generate_video(
         self,
         prompt: str,
@@ -2115,20 +2215,11 @@ class BrowserClient:
                 detail = data.get("event_data", "")
                 is_quota = any(k in str(detail) for k in ("今日生成次数已达上限", "次数已达上限", "额度已用尽", "达到今日上限", "次数超限"))
                 if is_quota and hasattr(self, "account_manager"):
-                    self.account_manager.mark_quota_exceeded(feature="video")
-                    if self.account_manager.has_alternative_accounts("video"):
-                        next_acc = self.account_manager.get_next_available_account("video")
-                        if next_acc:
-                            log.info("Video quota error 2005. Auto-switching to account %s (%s)...", next_acc.id, next_acc.name)
-                            if await self.switch_to_account(next_acc.id):
-                                return await self.generate_video(
-                                    prompt=prompt,
-                                    ratio=ratio,
-                                    ref_image_key=ref_image_key,
-                                    ref_image_keys=ref_image_keys,
-                                    memory_type=memory_type,
-                                    save_history=save_history,
-                                )
+                    self.account_manager.mark_quota_exceeded(
+                        account_id=self.account_manager.active_account_id,
+                        feature="video",
+                    )
+                    raise VideoQuotaExceeded("Video generation quota exceeded for active account")
                 raise RuntimeError(f"generate_video error: {str(detail)[:500]}")
             if et != 2001:
                 continue
@@ -2165,13 +2256,11 @@ class BrowserClient:
         full_text = "".join(text_parts)
         is_quota = any(k in full_text for k in ("今日生成次数已达上限", "次数已达上限", "额度已用尽", "达到今日上限", "次数超限"))
         if is_quota and hasattr(self, "account_manager"):
-            self.account_manager.mark_quota_exceeded(feature="video")
-            if self.account_manager.has_alternative_accounts("video"):
-                next_acc = self.account_manager.get_next_available_account("video")
-                if next_acc:
-                    log.info("Video quota exceeded in full_text. Auto-switching to account %s (%s)...", next_acc.id, next_acc.name)
-                    if await self.switch_to_account(next_acc.id):
-                        return await self.generate_video(prompt=prompt, ratio=ratio, ref_image_key=ref_image_key)
+            self.account_manager.mark_quota_exceeded(
+                account_id=self.account_manager.active_account_id,
+                feature="video",
+            )
+            raise VideoQuotaExceeded("Video generation quota exceeded for active account")
 
         if "服务过载" in full_text or "重试" in full_text:
             raise RuntimeError("视频生成服务过载，请稍后重试")
@@ -2186,6 +2275,7 @@ class BrowserClient:
         log.info("generate_video: polling task_id=%s", task_id)
         return await self._poll_video_result(task_id, prompt)
 
+    @_serialized_browser_operation
     async def _poll_video_result(
         self, task_id: str, prompt: str, timeout: float = 300
     ) -> Dict[str, Any]:
@@ -2265,6 +2355,7 @@ class BrowserClient:
     # File upload (TOS / ImageX flow)
     # ------------------------------------------------------------------
 
+    @_serialized_browser_operation
     async def upload_file(
         self,
         file_data: bytes,
@@ -2408,6 +2499,7 @@ class BrowserClient:
         return {"uri": store_uri, "name": filename, "size": file_size, "file_type": ext}
 
 
+    @_serialized_browser_operation
     async def get_file_download_url(
         self,
         uri: str,
@@ -2444,6 +2536,7 @@ class BrowserClient:
             raise RuntimeError("get_file_url returned no file_urls")
         return file_urls[0].get("main_url", "")
 
+    @_serialized_browser_operation
     async def upload_image(
         self,
         image_bytes: bytes,
@@ -2520,6 +2613,7 @@ class BrowserClient:
             "height": int(info.get("height") or img_h),
         }
 
+    @_serialized_browser_operation
     async def chat_with_file(
         self,
         text: str,
