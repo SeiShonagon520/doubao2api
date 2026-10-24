@@ -38,6 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .browser_client import BrowserClient
+from .upstream_errors import UpstreamAPIError, UpstreamError, parse_upstream_error
 
 
 def is_safe_url(url: str) -> bool:
@@ -400,14 +401,6 @@ def create_app(
                         consecutive_dead = 0
                 else:
                     consecutive_dead = 0
-                    # Auto-heal captcha if user completed it in the window
-                    if client.needs_captcha:
-                        if not await client.is_captcha_visible():
-                            log.info("Browser watchdog: captcha resolved! Auto-clearing captcha flag.")
-                            client.clear_captcha()
-                            client.record_success()
-                            client._ready = True
-
                     if not client.is_ready:
                         await client._check_login_state()
                         if client.is_ready:
@@ -473,6 +466,14 @@ def create_app(
                 pass
 
     app = FastAPI(title="Doubao API", version="1.0.0", lifespan=lifespan)
+
+    @app.exception_handler(UpstreamAPIError)
+    async def _upstream_exc(request: Request, exc: UpstreamAPIError):
+        error = exc.upstream_error
+        return JSONResponse(
+            status_code=error.status_code,
+            content=error.to_openai_error(_admin_url(request)),
+        )
 
     @app.exception_handler(HTTPException)
     async def _http_exc(request: Request, exc: HTTPException):
@@ -887,62 +888,129 @@ def create_app(
         result["expert_degraded"] = _expert_tracker.is_degraded
         return result
 
-    async def _resolve_captcha_or_failover(client: BrowserClient) -> None:
-        """Resolve captcha using 3-tier defense:
-        1. Auto-heal (if false alarm or already solved).
-        2. Auto-solver (humanized slider drag).
-        3. Account pool failover (switch to next healthy account).
-        4. Fallback: popup desktop window and raise 503.
-        """
+    def _admin_url(request: Request) -> str:
+        return f"{str(request.base_url).rstrip('/')}/admin"
+
+    def _event_has_output(event: dict) -> bool:
+        def _has_blocks(blocks: Any) -> bool:
+            if not isinstance(blocks, list):
+                return False
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                block_content = block.get("content", {})
+                if not isinstance(block_content, dict):
+                    continue
+                if block.get("block_type") == 10000:
+                    text_block = block_content.get("text_block", {})
+                    if isinstance(text_block, dict) and text_block.get("text"):
+                        return True
+                elif block.get("block_type") == 10025:
+                    if block_content.get("search_query_result_block"):
+                        return True
+                elif block.get("block_type") not in (10040, 10052) and block_content:
+                    return True
+            return False
+
+        if isinstance(event.get("text"), str) and event["text"]:
+            return True
+        for patch in event.get("patch_op", []):
+            if not isinstance(patch, dict):
+                continue
+            patch_value = patch.get("patch_value", {})
+            if not isinstance(patch_value, dict):
+                continue
+            if _has_blocks(patch_value.get("content_block", [])):
+                return True
+            content_str = patch_value.get("content")
+            if isinstance(content_str, str):
+                try:
+                    if json.loads(content_str).get("text"):
+                        return True
+                except (json.JSONDecodeError, AttributeError, TypeError):
+                    pass
+        content = event.get("content", {})
+        if isinstance(content, dict):
+            return _has_blocks(content.get("content_block", []))
+        return False
+
+    async def _recover_upstream_error(
+        client: BrowserClient,
+        error: UpstreamError,
+        admin_url: str,
+        *,
+        allow_account_switch: bool,
+        record_failure: bool = True,
+    ) -> Optional[str]:
+        """Resolve a verification error without clearing it before a successful request."""
+        code = int(error.code) if error.code and error.code.isdigit() else 0
+        if record_failure:
+            client.record_failure(
+                code or error.status_code,
+                verification_required=error.category == "verification",
+                error_category=error.category,
+            )
+        if error.category != "verification":
+            return None
+
+        visible = await client.is_captcha_visible()
+        if visible:
+            try:
+                if await client.try_auto_solve_captcha():
+                    return "same_account"
+            except Exception as exc:
+                log.warning("Captcha auto-solver failed (%s)", type(exc).__name__)
+
+        manager = client.account_manager
+        current_acc = manager.get_active_account() if manager else None
+        if manager and current_acc:
+            manager.mark_captcha_required(current_acc.id)
+        next_acc = manager.get_next_available_account() if manager and allow_account_switch else None
+        if next_acc and (not current_acc or next_acc.id != current_acc.id):
+            try:
+                switched = await client.switch_to_account(next_acc.id)
+            except Exception as exc:
+                log.warning("Account switch failed (%s)", type(exc).__name__)
+                switched = False
+            if switched:
+                return "account_switch"
+            if current_acc:
+                manager.set_active_account(current_acc.id)
+
+        if visible:
+            await client.auto_popup_for_captcha()
+        return None
+
+    async def _resolve_captcha_or_failover(
+        client: BrowserClient,
+        request: Request,
+        *,
+        allow_account_switch: bool,
+    ) -> None:
+        """Try explicit verification recovery; let a real request prove hidden recovery."""
         if not client.needs_captcha:
             return
 
-        # Tier 1: Check if captcha is still in DOM (false alarm or already solved)
-        if not await client.is_captcha_visible():
-            log.info("Auto-healed: cleared false alarm captcha flag (no visible captcha in DOM)")
-            client.clear_captcha()
-            client.record_success()
-            client._ready = True
+        safe_code = str(client.last_error_code) if str(client.last_error_code).isdigit() else None
+        error = UpstreamError(
+            "verification",
+            503,
+            code=safe_code,
+        )
+        recovered = await _recover_upstream_error(
+            client, error, _admin_url(request), allow_account_switch=allow_account_switch,
+            record_failure=False,
+        )
+        if recovered:
             return
 
-        # Tier 2: Attempt automated solving (humanized slider drag)
-        try:
-            solved = await client.try_auto_solve_captcha()
-            if solved:
-                log.info("Tier 2 auto-solver successfully bypassed captcha!")
-                return
-        except Exception as e:
-            log.warning("Tier 2 auto-solver failed: %s", e)
+        # A missing DOM challenge cannot prove recovery. A hidden challenge also
+        # gets one actual upstream request, whose success clears this state.
+        if not await client.is_captcha_visible():
+            return
 
-        # Tier 3: Account pool failover (switch to next healthy account)
-        if client.account_manager and client.account_manager.accounts:
-            current_acc = client.account_manager.get_active_account()
-            if current_acc:
-                client.account_manager.mark_captcha_required(current_acc.id)
-            next_acc = client.account_manager.get_next_available_account()
-            if next_acc and (not current_acc or next_acc.id != current_acc.id):
-                log.warning(
-                    "Captcha hit on account %s. Auto-failing over to account %s (%s)...",
-                    current_acc.id if current_acc else "unknown",
-                    next_acc.id,
-                    next_acc.name,
-                )
-                await client.apply_account(next_acc)
-                client.clear_captcha()
-                client._ready = True
-                return
-
-        # Tier 4: Fallback - popup desktop window and raise 503
-        popped = await client.auto_popup_for_captcha()
-        action_msg = (
-            "已为您在桌面上激活并置顶浏览器窗口，请在窗口中拖拽/点击完成验证码后重试；"
-            if popped
-            else "请在控制台 http://127.0.0.1:9090/admin 点击【唤起窗口】完成人机验证；"
-        )
-        raise HTTPException(
-            status_code=503,
-            detail=f"触发字节跳动人机验证：{action_msg}亦可在控制台切换其他账号或导入 Cookie 恢复服务。",
-        )
+        await client.auto_popup_for_captcha()
+        raise UpstreamAPIError(error)
 
     @app.get("/v1/models")
     async def list_models(request: Request):
@@ -955,6 +1023,8 @@ def create_app(
 
         # ── Tool calling mode ──
         has_tools = bool(body.tools)
+        file_refs = []
+        image_refs = []
         if has_tools:
             # Use expert model for tool calling, with auto-fallback to think if degraded
             requested_deep_think = CHAT_MODELS["doubao-expert"]
@@ -991,7 +1061,9 @@ def create_app(
         client = _get_client()
 
         # ── 3-Tier Captcha Defense & Account Failover ──
-        await _resolve_captcha_or_failover(client)
+        await _resolve_captcha_or_failover(
+            client, request, allow_account_switch=not bool(body.conversation_id)
+        )
 
         # ── Request Dispatch Smoothing (anti-burst rate limit) ──
         global _last_dispatch_time
@@ -1028,6 +1100,7 @@ def create_app(
                              has_tools=has_tools,
                              messages_for_counting=body.messages,
                              auto_delete=auto_delete,
+                             admin_url=_admin_url(request),
                              image_attachments=image_attachments,
                              file_attachments=file_attachments),
                 media_type="text/event-stream",
@@ -1041,6 +1114,8 @@ def create_app(
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    admin_url=_admin_url(request),
+                    allow_account_switch=not bool(body.conversation_id),
                     image_attachments=image_attachments,
                     file_attachments=file_attachments,
                 )
@@ -1064,12 +1139,20 @@ def create_app(
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
                     conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    admin_url=_admin_url(request),
+                    allow_account_switch=not bool(body.conversation_id),
                     image_attachments=image_attachments,
                     file_attachments=file_attachments,
                 )
                 finish_reason = "stop"
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+        except UpstreamAPIError as exc:
+            return JSONResponse(
+                exc.upstream_error.to_openai_error(_admin_url(request)),
+                status_code=exc.upstream_error.status_code,
+            )
+        except RuntimeError:
+            error = parse_upstream_error(None)
+            return JSONResponse(error.to_openai_error(_admin_url(request)), status_code=error.status_code)
 
         # max_tokens truncation (non-streaming only)
         content = message.get("content") or ""
@@ -1117,7 +1200,7 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
-        await _resolve_captcha_or_failover(client)
+        await _resolve_captcha_or_failover(client, request, allow_account_switch=True)
 
         ratio = body.ratio or _size_to_ratio(body.size)
         ref_image_keys = []
@@ -1191,7 +1274,7 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
-        await _resolve_captcha_or_failover(client)
+        await _resolve_captcha_or_failover(client, request, allow_account_switch=True)
 
         content_type = request.headers.get("content-type", "")
         prompt = ""
@@ -1370,7 +1453,7 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
-        await _resolve_captcha_or_failover(client)
+        await _resolve_captcha_or_failover(client, request, allow_account_switch=True)
 
         content_type = request.headers.get("content-type", "")
         prompt = ""
@@ -1646,6 +1729,9 @@ def create_app(
         bot_id: Optional[str] = None,
         image_attachments: Optional[list[dict[str, Any]]] = None,
         file_attachments: Optional[list[dict[str, Any]]] = None,
+        admin_url: Optional[str] = None,
+        allow_account_switch: bool = True,
+        _retries_remaining: int = 1,
     ) -> dict:
         """Collect full chat response with thinking separation.
 
@@ -1658,6 +1744,7 @@ def create_app(
         thinking_parts: list = []
         content_parts: list = []
         result_conversation_id: Optional[str] = None
+        saw_upstream_output = False
 
         def _iter_blocks(data: dict):
             for patch in data.get("patch_op", []):
@@ -1667,32 +1754,53 @@ def create_app(
             if isinstance(dc, dict):
                 yield from dc.get("content_block", [])
 
-        async for event in client.chat_completion(
+        event_iter = client.chat_completion(
             prompt, use_deep_think=use_deep_think,
             conversation_id=conversation_id or None,
             bot_id=bot_id or None,
             image_attachments=image_attachments,
             file_attachments=file_attachments,
-        ):
-            if event.get("error"):
-                raise RuntimeError(
-                    f"API error {event.get('status')}: "
-                    f"{event.get('body', '')[:200]}"
+        ).__aiter__()
+        async for event in event_iter:
+            if _event_has_output(event):
+                saw_upstream_output = True
+            event_type = event.get("_event", "")
+            if event.get("error") or event.get("error_code") or event_type == "STREAM_ERROR":
+                error = parse_upstream_error(event, status_code=event.get("status"))
+                close = getattr(event_iter, "aclose", None)
+                if close:
+                    await close()
+                can_attempt_retry = (
+                    _retries_remaining > 0
+                    and not saw_upstream_output
+                    and not content_parts
+                    and not thinking_parts
+                    and not _event_has_output(event)
                 )
-            if event.get("error_code"):
-                code = event.get("error_code", 0)
-                msg = event.get("error_msg", "")
-                log.error("RAW DOUBAO ERROR EVENT: %s", json.dumps(event, ensure_ascii=False))
-                client.record_failure(code)
-                if code in (710022002, 710022004):
-                    popped = await client.auto_popup_for_captcha()
-                    action_hint = (
-                        "已为您在桌面上自动弹出 Chrome 窗口，请完成验证码后重试；亦可访问 http://127.0.0.1:9090/admin 处置"
-                        if popped
-                        else "请访问 http://127.0.0.1:9090/admin 处置人机验证或重新导入 Cookie"
+                recovered = await _recover_upstream_error(
+                    client,
+                    error,
+                    admin_url or "",
+                    allow_account_switch=allow_account_switch and can_attempt_retry,
+                )
+                can_retry = (
+                    can_attempt_retry
+                    and (not conversation_id or recovered != "account_switch")
+                )
+                if recovered and can_retry:
+                    return await _collect_chat_response(
+                        client,
+                        prompt,
+                        use_deep_think,
+                        conversation_id=conversation_id,
+                        bot_id=bot_id,
+                        image_attachments=image_attachments,
+                        file_attachments=file_attachments,
+                        admin_url=admin_url,
+                        allow_account_switch=allow_account_switch,
+                        _retries_remaining=_retries_remaining - 1,
                     )
-                    raise RuntimeError(f"Error code={code}: {msg}（{action_hint}）")
-                raise RuntimeError(f"Error code={code}: {msg}")
+                raise UpstreamAPIError(error)
 
             # Extract conversation_id for multi-turn
             if not result_conversation_id:
@@ -1773,6 +1881,8 @@ def create_app(
         auto_delete: bool = False,
         image_attachments: Optional[list[dict[str, Any]]] = None,
         file_attachments: Optional[list[dict[str, Any]]] = None,
+        admin_url: Optional[str] = None,
+        _retry_count: int = 0,
     ):
         """Generate real-time SSE stream in OpenAI format via httpx streaming.
 
@@ -1794,8 +1904,14 @@ def create_app(
         tool_buffer = ""  # accumulates text when tool call detected
         tool_mode = False  # True when we're buffering potential tool call XML
         emitted_tool_calls = False  # True once we've emitted tool_calls chunks
+        stream_output_started = False
+        pending_event_task = None
+        event_iter = None
 
         def _make_chunk(delta: dict, finish_reason=None):
+            nonlocal stream_output_started
+            if any(key in delta for key in ("content", "reasoning_content", "tool_calls", "search_results")):
+                stream_output_started = True
             return {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -1827,54 +1943,70 @@ def create_app(
             ).__aiter__()
 
             while True:
-                try:
-                    event = await asyncio.wait_for(event_iter.__anext__(), timeout=5.0)
-                except asyncio.TimeoutError:
+                if pending_event_task is None:
+                    pending_event_task = asyncio.ensure_future(event_iter.__anext__())
+                done, _ = await asyncio.wait({pending_event_task}, timeout=5.0)
+                if not done:
                     # Emit SSE comment frame to keep connection alive through intermediate proxies
                     yield ": keep-alive\n\n"
                     continue
+                try:
+                    event = pending_event_task.result()
                 except StopAsyncIteration:
+                    pending_event_task = None
                     break
+                pending_event_task = None
 
-                if event.get("error"):
-                    chunk = _make_chunk(
-                        {"content": f"[Error {event.get('status')}]"}
-                    )
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+                if _event_has_output(event):
+                    stream_output_started = True
 
                 event_type = event.get("_event", "")
+                if event.get("error") or event.get("error_code") or event_type == "STREAM_ERROR":
+                    error = parse_upstream_error(event, status_code=event.get("status"))
+                    close = getattr(event_iter, "aclose", None)
+                    if close:
+                        await close()
+                    event_iter = None
+                    can_attempt_retry = _retry_count < 1 and not stream_output_started
+                    recovered = await _recover_upstream_error(
+                        client,
+                        error,
+                        admin_url or "",
+                        allow_account_switch=not bool(conversation_id) and can_attempt_retry,
+                    )
+                    can_retry = (
+                        recovered is not None
+                        and can_attempt_retry
+                        and (not conversation_id or recovered != "account_switch")
+                    )
+                    if can_retry:
+                        async for frame in _stream_chat(
+                            client,
+                            prompt,
+                            use_deep_think,
+                            request_id,
+                            model,
+                            conversation_id=conversation_id,
+                            bot_id=bot_id,
+                            has_tools=has_tools,
+                            messages_for_counting=messages_for_counting,
+                            auto_delete=auto_delete,
+                            image_attachments=image_attachments,
+                            file_attachments=file_attachments,
+                            admin_url=admin_url,
+                            _retry_count=_retry_count + 1,
+                        ):
+                            yield frame
+                        return
+                    yield f"data: {json.dumps(error.to_openai_error(admin_url), ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
                 # --- Extract conversation_id for multi-turn ---
                 if not result_conversation_id:
                     cid = client.extract_conversation_id(event)
                     if cid and cid != "0":
                         result_conversation_id = cid
-
-                # --- error_code handling (risk control, session expired) ---
-                if event_type == "STREAM_ERROR" or event.get("error_code"):
-                    code = event.get("error_code", 0)
-                    msg = event.get("error_msg", "unknown error")
-                    log.error("RAW DOUBAO STREAM ERROR EVENT: %s", json.dumps(event, ensure_ascii=False))
-                    client.record_failure(code)
-                    if code in (710022002, 710022004):
-                        popped = await client.auto_popup_for_captcha()
-                        action_hint = (
-                            "已为您在桌面上自动弹出 Chrome 浏览器窗口，请拖拽/点击完成验证码后重试；亦可访问控制台 http://127.0.0.1:9090/admin 处置。"
-                            if popped
-                            else "请访问控制台 http://127.0.0.1:9090/admin 点击【切换窗口模式】完成验证码，或重新导入已登录 Cookie。"
-                        )
-                        chunk = _make_chunk(
-                            {"content": f"\n\n[风控提示: 触发字节跳动人机验证 (Error code={code}: {msg})。{action_hint}]"}
-                        )
-                    else:
-                        chunk = _make_chunk(
-                            {"content": f"[Error code={code}: {msg}]"}
-                        )
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
 
                 # --- CHUNK_DELTA: compact {"text": "..."} (highest priority) ---
                 if (
@@ -2076,9 +2208,23 @@ def create_app(
                                     pass
 
         except Exception as exc:
-            log.error("Stream error: %s", exc)
-            chunk = _make_chunk({"content": f"[Error: {exc}]"})
-            yield f"data: {json.dumps(chunk)}\n\n"
+            log.error("Stream error (%s)", type(exc).__name__)
+            error = parse_upstream_error(None)
+            yield f"data: {json.dumps(error.to_openai_error(admin_url), ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        finally:
+            if pending_event_task is not None:
+                if not pending_event_task.done():
+                    pending_event_task.cancel()
+                await asyncio.gather(pending_event_task, return_exceptions=True)
+            if event_iter is not None:
+                close = getattr(event_iter, "aclose", None)
+                if close:
+                    try:
+                        await close()
+                    except Exception:
+                        pass
 
         # Flush any remaining tool buffer
         if tool_buffer:
