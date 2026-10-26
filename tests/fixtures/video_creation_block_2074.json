@@ -6,6 +6,7 @@
         "pull_singe_chain_downlink_body": {
           "messages": [
             {
+              "index_in_conv": "<str>",
               "ext": {},
               "content_block": [
                 {

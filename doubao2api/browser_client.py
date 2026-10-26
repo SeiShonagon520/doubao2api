@@ -1181,6 +1181,9 @@ class BrowserClient:
         chat_ability: Optional[Dict[str, Any]] = None,
         separate_attachment_messages: bool = False,
         memory_type: Optional[int] = None,
+        last_message_index: Optional[int] = None,
+        include_conversation_init_ext: bool = True,
+        include_image_cdn_url: bool = True,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
         if not self._page or self._page.is_closed() or not await self.is_alive():
@@ -1241,7 +1244,7 @@ class BrowserClient:
                         "name": img.get("name", "image.png"),
                         "uri": img.get("uri", ""),
                         "image_ori": {
-                            "url": img.get("cdn_url", ""),
+                            "url": img.get("cdn_url", "") if include_image_cdn_url else "",
                             "width": int(img["width"]),
                             "height": int(img["height"]),
                             "format": img.get("format", "png"),
@@ -1278,7 +1281,7 @@ class BrowserClient:
                                         "name": img.get("name", "image.png"),
                                         "uri": img.get("uri", ""),
                                         "image_ori": {
-                                            "url": img.get("cdn_url", ""),
+                                            "url": img.get("cdn_url", "") if include_image_cdn_url else "",
                                             "width": int(img.get("width") or 1024),
                                             "height": int(img.get("height") or 1024),
                                             "format": img.get("format", "png"),
@@ -1421,6 +1424,16 @@ class BrowserClient:
                 "commerce_credit_config_enable": "0",
             },
         }
+        if last_message_index is not None:
+            if (
+                isinstance(last_message_index, bool)
+                or not isinstance(last_message_index, int)
+                or last_message_index <= 0
+            ):
+                raise ValueError("last_message_index must be a positive integer")
+            payload["client_meta"]["last_message_index"] = last_message_index
+        if not include_conversation_init_ext:
+            payload["option"].pop("conversation_init_ext", None)
         if memory_type is not None:
             payload["option"]["message_storage_type"] = resolve_memory_type(memory_type)
         if chat_ability is not None:
@@ -2250,6 +2263,24 @@ class BrowserClient:
         return candidate if cls._is_http_video_url(candidate) else ""
 
     @staticmethod
+    def _positive_video_message_index(value: Any) -> Optional[int]:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value if value > 0 else None
+        if isinstance(value, str) and re.fullmatch(r"[1-9]\d{0,11}", value):
+            return int(value)
+        return None
+
+    @classmethod
+    def _max_video_message_index(cls, messages: List[Any]) -> Optional[int]:
+        indices = [
+            index
+            for message in messages
+            if isinstance(message, dict)
+            and (index := cls._positive_video_message_index(message.get("index_in_conv"))) is not None
+        ]
+        return max(indices) if indices else None
+
+    @staticmethod
     def _safe_video_number(value: Any, *, integer: bool = False) -> Union[int, float]:
         try:
             number = float(value)
@@ -2373,7 +2404,7 @@ class BrowserClient:
 
         all_messages = chain["messages"]
         if not all_messages:
-            return {"state": "pending", "videos": [], "message_count": 0}
+            return {"state": "pending", "videos": [], "message_count": 0, "max_message_index": None}
         messages = all_messages
         if conversation_id:
             explicit_conflict = any(
@@ -2390,6 +2421,8 @@ class BrowserClient:
             ]
             if not messages:
                 return {"state": "conversation_mismatch", "videos": [], "message_count": 0}
+
+        max_message_index = cls._max_video_message_index(messages)
 
         videos = []
         pending_count = 0
@@ -2434,7 +2467,12 @@ class BrowserClient:
                         "duration": cls._safe_video_number(video.get("duration")),
                     })
         if videos:
-            return {"state": "complete", "videos": videos, "message_count": len(messages)}
+            return {
+                "state": "complete",
+                "videos": videos,
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+            }
 
         decision_codes = []
         has_clarification_gate = False
@@ -2461,18 +2499,30 @@ class BrowserClient:
                 "state": "upstream_error",
                 "videos": [],
                 "message_count": len(messages),
+                "max_message_index": max_message_index,
                 "upstream_error": error,
             }
         # A resolved message (code 0) wins over a stale clarification message in
         # the same history response, regardless of server message ordering.
         if has_clarification_gate and "0" not in decision_codes:
-            return {"state": "confirmation_required", "videos": [], "message_count": len(messages)}
+            return {
+                "state": "confirmation_required",
+                "videos": [],
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+            }
         if malformed_count:
-            return {"state": "malformed_result", "videos": [], "message_count": len(messages)}
+            return {
+                "state": "malformed_result",
+                "videos": [],
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+            }
         return {
             "state": "pending",
             "videos": [],
             "message_count": len(messages),
+            "max_message_index": max_message_index,
             "pending_creation_count": pending_count,
         }
 
@@ -2516,11 +2566,14 @@ class BrowserClient:
         log.log(
             logging.INFO if result.get("state") in {"complete", "pending"} else logging.WARNING,
             "generate_video phase=history_read category=%s status=%s message_count=%d "
+            "read_attempt=%s max_message_index=%s "
             "block_types=%s creation_statuses=%s video_count=%d "
             "conversation_alias=%s business_codes=%s",
             result.get("state"),
             result.get("http_status"),
             len(messages),
+            result.get("read_attempt"),
+            result.get("max_message_index"),
             block_types,
             creation_statuses,
             len(result.get("videos", [])),
@@ -2661,9 +2714,10 @@ class BrowserClient:
         timeout: float = 600,
         poll_interval: float = 5,
         confirmation_sent: bool = False,
-        confirmation_callback: Optional[Callable[[], Any]] = None,
+        confirmation_callback: Optional[Callable[[int], Any]] = None,
     ) -> Dict[str, Any]:
         deadline = asyncio.get_running_loop().time() + timeout
+        read_attempt = 0
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -2671,17 +2725,26 @@ class BrowserClient:
             response = await self._read_video_creation_chain(
                 conversation_id, timeout=min(30, max(1, remaining))
             )
+            read_attempt += 1
             result = self._parse_video_creation_chain(response, conversation_id=conversation_id)
             result["response"] = response
             result["http_status"] = 200
             result["conversation_id"] = conversation_id
+            result["read_attempt"] = read_attempt
             self._log_video_chain_diagnostic(result)
             state = result.get("state")
             if state == "complete":
                 return {"videos": result["videos"], "conversation_id": conversation_id}
             if state == "confirmation_required":
                 if not confirmation_sent and confirmation_callback is not None:
-                    await confirmation_callback()
+                    last_message_index = result.get("max_message_index")
+                    if (
+                        isinstance(last_message_index, bool)
+                        or not isinstance(last_message_index, int)
+                        or last_message_index <= 0
+                    ):
+                        raise RuntimeError("Video generation failed (confirmation_index_unavailable)")
+                    await confirmation_callback(last_message_index)
                     confirmation_sent = True
                     continue
                 if not confirmation_sent:
@@ -2782,6 +2845,72 @@ class BrowserClient:
 
         visit(message.get("content_block", []))
         return "".join(parts)
+
+    @staticmethod
+    def _summarize_video_assistant_text(text: Any, *, fixture_prompt: str = "") -> Optional[Dict[str, str]]:
+        if not isinstance(text, str) or not text:
+            return None
+        if fixture_prompt:
+            text = text.replace(fixture_prompt, "<fixture-prompt>")
+        text = re.sub(r"https?://[^\s)\]]+", "<url>", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"(?i)(sessionid|msToken|x-bogus|a_bogus|authorization|cookie|signature|token)\s*[:=]\s*[^\s,;]+",
+            r"\1=<redacted>",
+            text,
+        )
+        text = re.sub(r"[A-Za-z0-9_-]{24,}", "<opaque>", text)
+        text = re.sub(r"\b\d{9,}\b", "<number>", text)[:2000]
+        if any(term in text for term in ("请确认", "确认后", "确认一下")):
+            category = "confirmation_requested"
+        elif any(term in text for term in ("请提供", "还需要", "请补充", "选择一个")):
+            category = "more_input_requested"
+        elif any(term in text for term in ("额度已用尽", "次数已达上限", "今日生成次数")):
+            category = "quota_or_limit"
+        elif any(term in text for term in ("生成好了", "生成完成", "视频已完成")):
+            category = "completion_claim"
+        elif any(term in text for term in ("无法生成", "不能生成", "生成失败")):
+            category = "refusal_or_error"
+        else:
+            category = "assistant_text"
+        return {"category": category, "excerpt": text}
+
+    @classmethod
+    def _summarize_video_assistant_event(
+        cls,
+        event_name: str,
+        event_data: Any,
+        *,
+        conversation_id: Optional[str],
+        fixture_prompt: str = "",
+    ) -> Optional[Dict[str, str]]:
+        if not isinstance(event_data, dict):
+            return None
+        if event_name == "STREAM_MSG_NOTIFY":
+            message = event_data.get("content")
+            metadata = event_data.get("meta")
+        elif event_name == "FULL_MSG_NOTIFY":
+            message = event_data.get("message")
+            metadata = message if isinstance(message, dict) else None
+        else:
+            return None
+        if not isinstance(message, dict):
+            return None
+        if isinstance(metadata, dict):
+            response_conversation_id = metadata.get("conversation_id")
+            if conversation_id and response_conversation_id and response_conversation_id != conversation_id:
+                return None
+            if metadata.get("user_type") == 1:
+                return None
+        blocks = message.get("content_block", [])
+        text_parts = []
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict) or block.get("block_type") != 10000:
+                continue
+            text_block = block.get("content", {}).get("text_block", {})
+            text = text_block.get("text") if isinstance(text_block, dict) else None
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        return cls._summarize_video_assistant_text("\n".join(text_parts), fixture_prompt=fixture_prompt)
 
     def _raise_video_event_error(
         self,
@@ -2903,6 +3032,7 @@ class BrowserClient:
         separate_attachment_messages: bool = False,
         memory_type: int,
         attachments_count: int,
+        last_message_index: Optional[int] = None,
     ) -> Optional[str]:
         result_conversation_id = conversation_id
         events: List[Dict[str, Any]] = []
@@ -2911,13 +3041,23 @@ class BrowserClient:
         turn_options: Dict[str, Any] = {
             "conversation_id": conversation_id,
             "memory_type": memory_type,
+            "include_conversation_init_ext": False,
         }
         if image_attachments is not None:
             turn_options["image_attachments"] = image_attachments
+            turn_options["include_image_cdn_url"] = False
         if chat_ability is not None:
             turn_options["chat_ability"] = chat_ability
         if separate_attachment_messages:
             turn_options["separate_attachment_messages"] = True
+        if last_message_index is not None:
+            if (
+                isinstance(last_message_index, bool)
+                or not isinstance(last_message_index, int)
+                or last_message_index <= 0
+            ):
+                raise RuntimeError("Video generation failed (confirmation_index_unavailable)")
+            turn_options["last_message_index"] = last_message_index
         async for event in self.chat_completion(text, **turn_options):
             if not isinstance(event, dict):
                 continue
@@ -3012,19 +3152,27 @@ class BrowserClient:
         result = self._parse_video_creation_chain(initial, conversation_id=conversation_id)
         confirmation_sent = False
 
-        async def _send_confirmation() -> None:
+        async def _send_confirmation(last_message_index: int) -> None:
             confirmed_conversation_id = await self._collect_video_chat_turn(
                 "确认，按上述参数开始生成视频。",
                 phase="confirmation",
                 conversation_id=conversation_id,
                 memory_type=effective_memory_type,
                 attachments_count=len(attachments),
+                last_message_index=last_message_index,
             )
             if confirmed_conversation_id != conversation_id:
                 raise RuntimeError("Video generation failed (conversation_mismatch)")
 
         if result["state"] == "confirmation_required":
-            await _send_confirmation()
+            last_message_index = result.get("max_message_index")
+            if (
+                isinstance(last_message_index, bool)
+                or not isinstance(last_message_index, int)
+                or last_message_index <= 0
+            ):
+                raise RuntimeError("Video generation failed (confirmation_index_unavailable)")
+            await _send_confirmation(last_message_index)
             confirmation_sent = True
         elif result["state"] == "complete":
             self._log_video_chain_diagnostic({
@@ -3032,6 +3180,7 @@ class BrowserClient:
                 "response": initial,
                 "http_status": 200,
                 "conversation_id": conversation_id,
+                "read_attempt": 0,
             })
             return {
                 "videos": result["videos"],

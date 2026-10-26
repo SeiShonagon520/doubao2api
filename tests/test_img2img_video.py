@@ -330,6 +330,35 @@ def test_images_generations_with_multiple_keys(test_app):
     )
 
 
+def _synthetic_video_creation_chain(*, index_in_conv=None, status=2, clarification=True):
+    ext = (
+        {"ai_creation_res_code": "710082041", "is_creation_clarifying": "1"}
+        if clarification else {"ai_creation_res_code": "0"}
+    )
+    message = {
+        "ext": ext,
+        "content_block": [{
+            "block_type": 2074,
+            "content": {"creation_block": {"creations": [{
+                "type": 2,
+                "video": {
+                    "download_url": "https://video.test/synthetic-result.mp4",
+                    "status": status,
+                    "width": 640,
+                    "height": 640,
+                    "duration": 10,
+                },
+            }]}},
+        }],
+    }
+    if index_in_conv is not None:
+        message["index_in_conv"] = index_in_conv
+    return {
+        "status_code": 0,
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": [message]}},
+    }
+
+
 def test_browser_client_video_uses_native_layout_and_one_confirmed_continuation(caplog):
     import asyncio
     import logging
@@ -361,14 +390,7 @@ def test_browser_client_video_uses_native_layout_and_one_confirmed_continuation(
             yield {"ack_client_meta": {"conversation_id": conversation_id}}
 
         client.chat_completion = fake_chat_completion
-        chain = _native_chain_fixture()["response"]["json"]
-        first_message = _native_chain_message(chain)
-        first_message["ext"].update({
-            "ai_creation_res_code": "710082041",
-            "is_creation_clarifying": "1",
-        })
-        video_block = next(block for block in first_message["content_block"] if block.get("block_type") == 2074)
-        video_block["content"]["creation_block"]["creations"][0]["video"]["status"] = 2
+        chain = _synthetic_video_creation_chain(index_in_conv=14)
         client._read_video_creation_chain = AsyncMock(return_value=chain)
         client._poll_video_creation_result = AsyncMock(return_value={
             "videos": [{"video_url": "https://video.test/result.mp4"}],
@@ -398,7 +420,10 @@ def test_browser_client_video_uses_native_layout_and_one_confirmed_continuation(
             },
         }
         assert first_options["separate_attachment_messages"] is True
+        assert first_options["include_conversation_init_ext"] is False
+        assert first_options["include_image_cdn_url"] is False
         assert [item["uri"] for item in first_options["image_attachments"]] == image_keys
+        assert first_options["image_attachments"][0]["cdn_url"] == "https://image.test/0.png"
         assert first_options["memory_type"] == 0
 
         second_text, second_options = calls[1]
@@ -407,6 +432,8 @@ def test_browser_client_video_uses_native_layout_and_one_confirmed_continuation(
         assert "chat_ability" not in second_options
         assert "image_attachments" not in second_options
         assert second_options["memory_type"] == 0
+        assert second_options["last_message_index"] == 14
+        assert second_options["include_conversation_init_ext"] is False
         client._read_video_creation_chain.assert_awaited_once_with(conversation_id)
         poll_kwargs = client._poll_video_creation_result.await_args.kwargs
         assert poll_kwargs["timeout"] == 600
@@ -476,22 +503,13 @@ def test_video_confirms_once_when_gate_arrives_after_initial_pending(monkeypatch
             yield {"ack_client_meta": {"conversation_id": conversation_id}}
 
         client.chat_completion = fake_chat_completion
-        fixture = _native_chain_fixture()["response"]["json"]
         empty = {
             "status_code": 0,
             "downlink_body": {"pull_singe_chain_downlink_body": {"messages": []}},
         }
-        clarification = copy.deepcopy(fixture)
-        clarifying_message = _native_chain_message(clarification)
-        clarifying_message["content_block"] = []
-        clarifying_message["ext"] = {
-            "ai_creation_res_code": "710082041",
-            "is_creation_clarifying": "1",
-        }
+        clarification = _synthetic_video_creation_chain(index_in_conv="19")
         stale = copy.deepcopy(clarification)
-        complete = copy.deepcopy(fixture)
-        completed_message = _native_chain_message(complete)
-        completed_message["ext"] = {"ai_creation_res_code": "0"}
+        complete = _native_chain_fixture()["response"]["json"]
         client._read_video_creation_chain = AsyncMock(side_effect=[empty, clarification, stale, complete])
 
         result = await client.generate_video(prompt="eventual clarification")
@@ -502,9 +520,71 @@ def test_video_confirms_once_when_gate_arrives_after_initial_pending(monkeypatch
         assert calls[1][1]["conversation_id"] == conversation_id
         assert "chat_ability" not in calls[1][1]
         assert "image_attachments" not in calls[1][1]
+        assert calls[1][1]["last_message_index"] == 19
         assert client._read_video_creation_chain.await_count == 4
 
     monkeypatch.setattr("doubao2api.browser_client.asyncio.sleep", AsyncMock())
+    asyncio.run(_run())
+
+
+def test_video_confirmation_fails_closed_when_chain_has_no_index(tmp_path):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from doubao2api.browser_client import BrowserClient
+
+    async def _run():
+        client = BrowserClient(headless=True, user_data_dir=str(tmp_path))
+        client.account_manager = None
+        calls = []
+
+        async def fake_chat_completion(text, **kwargs):
+            calls.append((text, kwargs))
+            yield {"ack_client_meta": {"conversation_id": "current-video-conversation"}}
+
+        client.chat_completion = fake_chat_completion
+        client._read_video_creation_chain = AsyncMock(
+            return_value=_synthetic_video_creation_chain(index_in_conv=None)
+        )
+        client._poll_video_creation_result = AsyncMock()
+
+        with pytest.raises(RuntimeError, match="confirmation_index_unavailable"):
+            await client.generate_video(prompt="fixture without sequence index")
+
+        assert len(calls) == 1
+        client._poll_video_creation_result.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_delayed_confirmation_without_index_fails_without_sending(tmp_path):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from doubao2api.browser_client import BrowserClient
+
+    async def _run():
+        client = BrowserClient(headless=True, user_data_dir=str(tmp_path))
+        client.account_manager = None
+        calls = []
+
+        async def fake_chat_completion(text, **kwargs):
+            calls.append((text, kwargs))
+            yield {"ack_client_meta": {"conversation_id": "current-video-conversation"}}
+
+        client.chat_completion = fake_chat_completion
+        empty = {
+            "status_code": 0,
+            "downlink_body": {"pull_singe_chain_downlink_body": {"messages": []}},
+        }
+        client._read_video_creation_chain = AsyncMock(
+            side_effect=[empty, _synthetic_video_creation_chain(index_in_conv=None)]
+        )
+
+        with pytest.raises(RuntimeError, match="confirmation_index_unavailable"):
+            await client.generate_video(prompt="late gate without index")
+
+        assert len(calls) == 1
+        assert client._read_video_creation_chain.await_count == 2
+
     asyncio.run(_run())
 
 
@@ -633,7 +713,10 @@ def test_chat_completion_video_layout_is_opt_in_and_matches_capture():
         normal = await capture_payload(normal_client, image_attachments=attachments)
         assert len(normal["messages"]) == 1
         assert "chat_ability" not in normal
+        assert "conversation_init_ext" in normal["option"]
         assert len([b for b in normal["messages"][0]["content_block"] if b["block_type"] == 10052]) == 2
+        normal_image = normal["messages"][0]["content_block"][0]["content"]["attachment_block"]["attachments"][0]["image"]
+        assert normal_image["image_ori"]["url"] == "https://image.test/a.png"
 
         video_client = BrowserClient(headless=True)
         ability = {
@@ -653,16 +736,22 @@ def test_chat_completion_video_layout_is_opt_in_and_matches_capture():
             image_attachments=attachments,
             chat_ability=ability,
             separate_attachment_messages=True,
+            include_conversation_init_ext=False,
+            include_image_cdn_url=False,
         )
         assert video["chat_ability"] == ability
+        assert "conversation_init_ext" not in video["option"]
         assert len(video["messages"]) == 2
         image_blocks = video["messages"][0]["content_block"]
         assert [block["block_type"] for block in image_blocks] == [10052]
         assert len(image_blocks[0]["content"]["attachment_block"]["attachments"]) == 2
         first_image = image_blocks[0]["content"]["attachment_block"]["attachments"][0]["image"]
         assert first_image["uri"] == "tos-fixture-a"
+        assert first_image["image_ori"]["url"] == ""
         assert first_image["image_ori"]["width"] == 640
         assert first_image["image_ori"]["height"] == 640
+        assert first_image["image_ori"]["format"] == "png"
+        assert first_image["name"] == "a.png"
         assert video["messages"][1]["content_block"][0]["block_type"] == 10000
 
     asyncio.run(_run())
@@ -696,6 +785,40 @@ def test_chat_completion_applies_video_memory_type_without_changing_default():
         assert await capture(BrowserClient(headless=True), memory_type=2) == 2
 
     asyncio.run(_run())
+
+
+def test_chat_completion_only_sets_last_message_index_when_video_confirms():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from doubao2api.browser_client import BrowserClient
+
+    async def capture(client, *, last_message_index=None):
+        captured = []
+
+        async def fake_fetch(url, payload, request_id):
+            captured.append(payload)
+            client._stream_queues[request_id].put_nowait(None)
+
+        client._page = MagicMock()
+        client._page.is_closed.return_value = False
+        client._ready = True
+        client.is_alive = AsyncMock(return_value=True)
+        client._sign_url = AsyncMock(return_value="/chat/completion?fixture")
+        client._browser_fetch_stream = fake_fetch
+        options = {"last_message_index": last_message_index} if last_message_index is not None else {}
+        async for _ in client.chat_completion("fixture", **options):
+            pass
+        return captured[0]
+
+    async def _run():
+        default_payload = await capture(BrowserClient(headless=True))
+        assert default_payload["client_meta"]["last_message_index"] is None
+
+        video_payload = await capture(BrowserClient(headless=True), last_message_index=19)
+        assert video_payload["client_meta"]["last_message_index"] == 19
+
+    asyncio.run(_run())
+
 
 def test_browser_client_no_conversation_error_logs_only_safe_video_metadata(tmp_path, caplog):
     import asyncio
@@ -1054,6 +1177,40 @@ def test_native_creation_chain_empty_messages_are_pending_for_new_conversation()
     assert result["state"] == "pending"
 
 
+def test_native_creation_chain_selects_maximum_positive_message_index():
+    from doubao2api.browser_client import BrowserClient
+
+    messages = [
+        {"index_in_conv": 4, "ext": {}, "content_block": []},
+        {"index_in_conv": "19", "ext": {}, "content_block": []},
+        {"index_in_conv": 0, "ext": {}, "content_block": []},
+        {"index_in_conv": True, "ext": {}, "content_block": []},
+        {"index_in_conv": "<str>", "ext": {}, "content_block": []},
+        {"ext": {}, "content_block": []},
+    ]
+    response = {
+        "status_code": 0,
+        "downlink_body": {"pull_singe_chain_downlink_body": {"messages": messages}},
+    }
+
+    parsed = BrowserClient._parse_video_creation_chain(response)
+
+    assert parsed["state"] == "pending"
+    assert parsed["max_message_index"] == 19
+
+
+def test_native_video_fixture_redacted_message_index_is_not_guessed():
+    from doubao2api.browser_client import BrowserClient
+
+    parsed = BrowserClient._parse_video_creation_chain(
+        _native_chain_fixture()["response"]["json"],
+        conversation_id="current-api-conversation",
+    )
+
+    assert parsed["state"] == "complete"
+    assert parsed["max_message_index"] is None
+
+
 def test_native_creation_chain_result_beats_stale_clarification_in_either_order():
     import copy
     from doubao2api.browser_client import BrowserClient
@@ -1133,16 +1290,69 @@ def test_video_chain_diagnostics_keep_numeric_code_and_hash_conversation_id(capl
     client._log_video_chain_diagnostic({
         "state": "upstream_error",
         "http_status": 200,
+        "read_attempt": 4,
+        "max_message_index": 19,
         "response": response,
         "conversation_id": conversation_id,
     })
 
     alias = hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:12]
     assert f"conversation_alias={alias}" in caplog.text
+    assert "read_attempt=4" in caplog.text
+    assert "max_message_index=19" in caplog.text
     assert "business_codes=['710082041']" in caplog.text
     assert conversation_id not in caplog.text
     assert "another-private-conversation-id" not in caplog.text
     assert "private-error-code" not in caplog.text
+
+
+def test_assistant_reply_summary_preserves_semantics_and_masks_private_values():
+    from doubao2api.browser_client import BrowserClient
+
+    conversation_id = "private-api-conversation-id"
+    fixture_prompt = "private fixture prompt"
+    secret_url = "https://cdn.example/video.mp4?signature=private-signature"
+    secret_token = "sessionid=private-cookie-value"
+    opaque_id = "opaque_identifier_value_1234567890"
+    event = {
+        "meta": {"conversation_id": conversation_id, "user_type": 2},
+        "content": {"content_block": [{
+            "block_type": 10000,
+            "content": {"text_block": {
+                "text": f"确认后我再开始生成视频。{fixture_prompt} {secret_url} {secret_token} {opaque_id}"
+            }},
+        }]},
+    }
+
+    summary = BrowserClient._summarize_video_assistant_event(
+        "STREAM_MSG_NOTIFY",
+        event,
+        conversation_id=conversation_id,
+        fixture_prompt=fixture_prompt,
+    )
+    assert summary["category"] == "confirmation_requested"
+    assert "确认后我再开始生成视频" in summary["excerpt"]
+    assert fixture_prompt not in summary["excerpt"]
+    assert secret_url not in summary["excerpt"]
+    assert "cdn.example" not in summary["excerpt"]
+    assert "private-cookie-value" not in summary["excerpt"]
+    assert opaque_id not in summary["excerpt"]
+    assert conversation_id not in summary["excerpt"]
+
+    user_event = {
+        **event,
+        "meta": {"conversation_id": conversation_id, "user_type": 1},
+    }
+    foreign_event = {
+        **event,
+        "meta": {"conversation_id": "other-conversation", "user_type": 2},
+    }
+    assert BrowserClient._summarize_video_assistant_event(
+        "STREAM_MSG_NOTIFY", user_event, conversation_id=conversation_id, fixture_prompt=fixture_prompt
+    ) is None
+    assert BrowserClient._summarize_video_assistant_event(
+        "STREAM_MSG_NOTIFY", foreign_event, conversation_id=conversation_id, fixture_prompt=fixture_prompt
+    ) is None
 
 
 @pytest.mark.parametrize("status,expected_state", [(2, "pending"), (3, "malformed_result")])
