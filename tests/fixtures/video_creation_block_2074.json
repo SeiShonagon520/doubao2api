@@ -1,0 +1,38 @@
+{
+  "response": {
+    "json": {
+      "status_code": 0,
+      "downlink_body": {
+        "pull_singe_chain_downlink_body": {
+          "messages": [
+            {
+              "index_in_conv": "<str>",
+              "ext": {},
+              "content_block": [
+                {
+                  "block_type": 2074,
+                  "content": {
+                    "creation_block": {
+                      "creations": [
+                        {
+                          "type": 2,
+                          "video": {
+                            "download_url": "https://video.test/native-result.mp4",
+                            "status": 3,
+                            "width": 720,
+                            "height": 720,
+                            "duration": 10.08
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

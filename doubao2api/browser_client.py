@@ -13,20 +13,23 @@ and call this signing function. All actual API traffic goes through httpx.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from functools import wraps
-from typing import AsyncGenerator, Optional, Dict, Any, List, Union
-from urllib.parse import urlencode
+from typing import AsyncGenerator, Optional, Dict, Any, List, Union, Callable
+from urllib.parse import urlencode, urlsplit
 
 import httpx
 from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
 from .browser_operation import BrowserOperationGate
+from .upstream_errors import UpstreamAPIError, parse_upstream_error
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +42,15 @@ DEFAULT_BOT_ID = "7338286299411103781"
 
 class VideoQuotaExceeded(RuntimeError):
     """The active account has reached its daily video generation quota."""
+
+
+_VIDEO_QUOTA_HINTS = (
+    "今日生成次数已达上限",
+    "次数已达上限",
+    "额度已用尽",
+    "达到今日上限",
+    "次数超限",
+)
 
 
 def _serialized_browser_operation(method):
@@ -149,6 +161,8 @@ class BrowserClient:
         self._device_id: Optional[str] = None
         self._web_id: Optional[str] = None
         self._fp: Optional[str] = None
+        self._pc_version: Optional[str] = None
+        self._uploaded_image_metadata: Dict[str, Dict[str, Any]] = {}
         # msToken rotation: updated from x-ms-token response header
         self._ms_token: str = ""
         # Robustness: failure tracking
@@ -803,11 +817,22 @@ class BrowserClient:
                         .map(c => c.trim())
                         .find(c => c.startsWith('s_v_web_id='));
                     result.fp = fpCookie ? fpCookie.split('=')[1] : '';
+                    try {
+                        for (const entry of performance.getEntriesByType('resource')) {
+                            const url = new URL(entry.name, location.href);
+                            const version = url.searchParams.get('doubao_pc_version') || url.searchParams.get('pc_version');
+                            if (version && /^[0-9.]{1,24}$/.test(version)) {
+                                result.pc_version = version;
+                                break;
+                            }
+                        }
+                    } catch(e) {}
                     return result;
                 }""")
             self._device_id = params.get("device_id", "")
             self._web_id = params.get("web_id", "")
             self._fp = params.get("fp", "")
+            self._pc_version = params.get("pc_version") or self._pc_version
             if self._device_id and self._web_id:
                 break
             await asyncio.sleep(1)
@@ -1096,8 +1121,8 @@ class BrowserClient:
             "web_platform": "browser",
             "fp": self._fp or "",
             "language": "zh",
-            "pc_version": "3.36.0",
-            "doubao_pc_version": "3.36.0",
+            "pc_version": self._pc_version or "3.36.0",
+            "doubao_pc_version": self._pc_version or "3.36.0",
             "pkg_type": "release_version",
             "real_aid": "497858",
             "region": "CN",
@@ -1153,6 +1178,12 @@ class BrowserClient:
         use_deep_think: int = 0,
         image_attachments: Optional[List[Dict[str, Any]]] = None,
         file_attachments: Optional[List[Dict[str, Any]]] = None,
+        chat_ability: Optional[Dict[str, Any]] = None,
+        separate_attachment_messages: bool = False,
+        memory_type: Optional[int] = None,
+        last_message_index: Optional[int] = None,
+        include_conversation_init_ext: bool = True,
+        include_image_cdn_url: bool = True,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Send a chat message and yield SSE events via in-browser fetch."""
         if not self._page or self._page.is_closed() or not await self.is_alive():
@@ -1205,38 +1236,71 @@ class BrowserClient:
 
         # 2. Image attachments (type=1) with genuine dimensions
         if image_attachments:
-            for img in image_attachments:
+            if separate_attachment_messages:
+                image_items = [{
+                    "type": 1,
+                    "identifier": str(uuid.uuid4()),
+                    "image": {
+                        "name": img.get("name", "image.png"),
+                        "uri": img.get("uri", ""),
+                        "image_ori": {
+                            "url": img.get("cdn_url", "") if include_image_cdn_url else "",
+                            "width": int(img["width"]),
+                            "height": int(img["height"]),
+                            "format": img.get("format", "png"),
+                            "url_formats": {},
+                        },
+                    },
+                    "parse_state": 0,
+                    "review_state": 1,
+                    "upload_status": 1,
+                    "progress": 100,
+                    "src": "",
+                } for img in image_attachments]
                 content_blocks.append({
                     "block_type": 10052,
                     "content": {
-                        "attachment_block": {
-                            "attachments": [{
-                                "type": 1,
-                                "identifier": str(uuid.uuid4()),
-                                "image": {
-                                    "name": img.get("name", "image.png"),
-                                    "uri": img.get("uri", ""),
-                                    "image_ori": {
-                                        "url": img.get("cdn_url", ""),
-                                        "width": int(img.get("width") or 1024),
-                                        "height": int(img.get("height") or 1024),
-                                        "format": img.get("format", "png"),
-                                        "url_formats": {},
-                                    },
-                                },
-                                "parse_state": 0,
-                                "review_state": 0,
-                            }],
-                        },
+                        "attachment_block": {"attachments": image_items},
                         "pc_event_block": "",
                     },
                     "block_id": str(uuid.uuid4()),
                     "parent_id": "",
                     "meta_info": [],
                     "append_fields": [],
-                    "is_finish": True,
-                    "patch_type": 2,
                 })
+            else:
+                for img in image_attachments:
+                    content_blocks.append({
+                        "block_type": 10052,
+                        "content": {
+                            "attachment_block": {
+                                "attachments": [{
+                                    "type": 1,
+                                    "identifier": str(uuid.uuid4()),
+                                    "image": {
+                                        "name": img.get("name", "image.png"),
+                                        "uri": img.get("uri", ""),
+                                        "image_ori": {
+                                            "url": img.get("cdn_url", "") if include_image_cdn_url else "",
+                                            "width": int(img.get("width") or 1024),
+                                            "height": int(img.get("height") or 1024),
+                                            "format": img.get("format", "png"),
+                                            "url_formats": {},
+                                        },
+                                    },
+                                    "parse_state": 0,
+                                    "review_state": 0,
+                                }],
+                            },
+                            "pc_event_block": "",
+                        },
+                        "block_id": str(uuid.uuid4()),
+                        "parent_id": "",
+                        "meta_info": [],
+                        "append_fields": [],
+                        "is_finish": True,
+                        "patch_type": 2,
+                    })
 
         # 3. Text block (block_type 10000)
         content_blocks.append({
@@ -1251,6 +1315,28 @@ class BrowserClient:
             "append_fields": [],
         })
 
+        if separate_attachment_messages:
+            messages = []
+            attachment_blocks = content_blocks[:-1]
+            text_block = content_blocks[-1]
+            if attachment_blocks:
+                messages.append({
+                    "local_message_id": msg_uuid,
+                    "content_block": attachment_blocks,
+                    "message_status": 0,
+                })
+            messages.append({
+                "local_message_id": str(uuid.uuid4()),
+                "content_block": [text_block],
+                "message_status": 0,
+            })
+        else:
+            messages = [{
+                "local_message_id": msg_uuid,
+                "content_block": content_blocks,
+                "message_status": 0,
+            }]
+
         payload = {
             "client_meta": {
                 "local_conversation_id": local_conv_id if need_create else "",
@@ -1264,11 +1350,7 @@ class BrowserClient:
                     {"permission_name": "ACCESS_BACKGROUND_LOCATION", "status": 3},
                 ],
             },
-            "messages": [{
-                "local_message_id": msg_uuid,
-                "content_block": content_blocks,
-                "message_status": 0,
-            }],
+            "messages": messages,
             "option": {
                 "send_message_scene": "",
                 "create_time_ms": now_ms,
@@ -1342,6 +1424,20 @@ class BrowserClient:
                 "commerce_credit_config_enable": "0",
             },
         }
+        if last_message_index is not None:
+            if (
+                isinstance(last_message_index, bool)
+                or not isinstance(last_message_index, int)
+                or last_message_index <= 0
+            ):
+                raise ValueError("last_message_index must be a positive integer")
+            payload["client_meta"]["last_message_index"] = last_message_index
+        if not include_conversation_init_ext:
+            payload["option"].pop("conversation_init_ext", None)
+        if memory_type is not None:
+            payload["option"]["message_storage_type"] = resolve_memory_type(memory_type)
+        if chat_ability is not None:
+            payload["chat_ability"] = chat_ability
 
         # Build URL with query params and X-Bogus signature via bdms.frontierSign
         query_params = self._build_query_params()
@@ -2089,6 +2185,917 @@ class BrowserClient:
         log.info("generate_music: got %d tracks", len(tracks))
         return {"tracks": tracks, "prompt": prompt}
 
+    @staticmethod
+    def _decode_samantha_object(value: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError, RecursionError):
+                return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _is_http_video_url(value: Any) -> bool:
+        if not isinstance(value, str) or not value or any(char.isspace() for char in value):
+            return False
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                return False
+            port = parsed.port
+            return port is None or 1 <= port <= 65535
+        except ValueError:
+            return False
+
+    @classmethod
+    def _video_url_from_item(cls, item: Dict[str, Any]) -> str:
+        import base64
+
+        for key in ("download_url", "video_url", "url"):
+            direct = item.get(key)
+            if cls._is_http_video_url(direct):
+                return direct
+
+        model = cls._decode_samantha_object(item.get("video_model"))
+        if model and isinstance(model.get("json_string"), dict):
+            model = model["json_string"]
+        if not model:
+            return ""
+        video_list = model.get("video_list", {})
+        if isinstance(video_list, str):
+            video_list = cls._decode_samantha_object(video_list)
+        values = video_list.values() if isinstance(video_list, dict) else video_list if isinstance(video_list, list) else []
+        for video_info in values:
+            if isinstance(video_info, str):
+                video_info = cls._decode_samantha_object(video_info)
+            if not isinstance(video_info, dict):
+                continue
+            for key in ("main_url", "download_url", "url", "backup_url"):
+                candidate = video_info.get(key)
+                if cls._is_http_video_url(candidate):
+                    return candidate
+                if not isinstance(candidate, str) or not candidate:
+                    continue
+                try:
+                    padded = candidate + "=" * (-len(candidate) % 4)
+                    decoded = base64.b64decode(padded).decode("utf-8", errors="strict")
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    continue
+                if cls._is_http_video_url(decoded):
+                    return decoded
+        return ""
+
+    @classmethod
+    def _video_cover_url(cls, video: Dict[str, Any]) -> str:
+        cover = video.get("cover")
+        if isinstance(cover, str) and cls._is_http_video_url(cover):
+            return cover
+        if isinstance(cover, dict):
+            for key in ("url", "cover_url"):
+                candidate = cover.get(key)
+                if cls._is_http_video_url(candidate):
+                    return candidate
+            for key in ("image_ori", "image_thumb", "image_raw"):
+                image = cover.get(key)
+                if isinstance(image, dict) and cls._is_http_video_url(image.get("url")):
+                    return image["url"]
+        candidate = video.get("cover_url")
+        return candidate if cls._is_http_video_url(candidate) else ""
+
+    @staticmethod
+    def _positive_video_message_index(value: Any) -> Optional[int]:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value if value > 0 else None
+        if isinstance(value, str) and re.fullmatch(r"[1-9]\d{0,11}", value):
+            return int(value)
+        return None
+
+    @classmethod
+    def _max_video_message_index(cls, messages: List[Any]) -> Optional[int]:
+        indices = [
+            index
+            for message in messages
+            if isinstance(message, dict)
+            and (index := cls._positive_video_message_index(message.get("index_in_conv"))) is not None
+        ]
+        return max(indices) if indices else None
+
+    @staticmethod
+    def _safe_video_number(value: Any, *, integer: bool = False) -> Union[int, float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0 if integer else 0.0
+        if not (number >= 0 and number < float("inf")):
+            return 0 if integer else 0.0
+        return int(number) if integer else number
+
+    @staticmethod
+    def _is_video_confirmation_required(message: Any) -> bool:
+        if not isinstance(message, dict):
+            return False
+        ext = message.get("ext", {})
+        if not isinstance(ext, dict):
+            return False
+        return (
+            str(ext.get("is_creation_clarifying", "")) == "1"
+            and str(ext.get("ai_creation_res_code", "")) == "710082041"
+        )
+
+    @classmethod
+    def _video_response_metadata(
+        cls, events: List[Dict[str, Any]]
+    ) -> tuple[List[Any], List[int]]:
+        event_types = set()
+        content_types = set()
+        sse_names = {
+            "SSE_ACK", "FULL_MSG_NOTIFY", "STREAM_MSG_NOTIFY", "STREAM_CHUNK",
+            "CHUNK_DELTA", "SSE_REPLY_END", "SSE_HEARTBEAT", "DOWNLINK_CMD",
+        }
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_type = event.get("event_type")
+            if isinstance(event_type, int) and not isinstance(event_type, bool):
+                event_types.add(event_type)
+            event_name = event.get("_event")
+            if isinstance(event_name, str) and event_name in sse_names:
+                event_types.add(event_name)
+            event_data = cls._decode_samantha_object(event.get("event_data"))
+            if event_data is None:
+                event_data = cls._decode_samantha_object(event.get("data"))
+            message = cls._decode_samantha_object(event_data.get("message")) if event_data else None
+            if message is None:
+                message = cls._decode_samantha_object(event.get("message"))
+            if message is None:
+                continue
+            content_type = message.get("content_type")
+            if isinstance(content_type, int) and not isinstance(content_type, bool):
+                content_types.add(content_type)
+        return sorted(event_types), sorted(content_types)
+
+    @classmethod
+    def _extract_video_results(
+        cls, events: List[Dict[str, Any]]
+    ) -> tuple[List[Dict[str, Any]], int]:
+        videos = []
+        malformed_count = 0
+        for event in events:
+            if not isinstance(event, dict) or event.get("event_type") != 2001:
+                continue
+            event_data = cls._decode_samantha_object(event.get("event_data"))
+            if event_data is None:
+                malformed_count += 1
+                continue
+            message = cls._decode_samantha_object(event_data.get("message"))
+            if message is None:
+                if "message" in event_data:
+                    malformed_count += 1
+                continue
+            if message.get("content_type") != 2021:
+                continue
+
+            content = cls._decode_samantha_object(message.get("content"))
+            if content is None:
+                malformed_count += 1
+                continue
+            items = content.get("data", [content])
+            if isinstance(items, dict):
+                items = [items]
+            if not isinstance(items, list):
+                malformed_count += 1
+                continue
+
+            for item in items:
+                if not isinstance(item, dict):
+                    malformed_count += 1
+                    continue
+                video_url = cls._video_url_from_item(item)
+                if not cls._is_http_video_url(video_url):
+                    malformed_count += 1
+                    continue
+                videos.append({
+                    "video_url": video_url,
+                    "cover_url": cls._video_cover_url(item),
+                    "width": item.get("width", 0),
+                    "height": item.get("height", 0),
+                    "duration": item.get("duration", 0.0),
+                })
+        return videos, malformed_count
+
+    @classmethod
+    def _parse_video_creation_chain(
+        cls,
+        response: Any,
+        *,
+        conversation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(response, dict):
+            return {"state": "malformed_response", "videos": [], "message_count": 0}
+        outer_code = response.get("status_code")
+        if outer_code not in (None, 0, "0", 200, "200"):
+            error = parse_upstream_error({"code": outer_code})
+            return {"state": "upstream_error", "videos": [], "message_count": 0, "upstream_error": error}
+
+        downlink = response.get("downlink_body")
+        chain = downlink.get("pull_singe_chain_downlink_body") if isinstance(downlink, dict) else None
+        if not isinstance(chain, dict) or not isinstance(chain.get("messages"), list):
+            return {"state": "malformed_response", "videos": [], "message_count": 0}
+
+        all_messages = chain["messages"]
+        if not all_messages:
+            return {"state": "pending", "videos": [], "message_count": 0, "max_message_index": None}
+        messages = all_messages
+        if conversation_id:
+            explicit_conflict = any(
+                isinstance(message, dict)
+                and message.get("conversation_id") not in (None, "", "0", conversation_id)
+                for message in all_messages
+            )
+            if explicit_conflict:
+                return {"state": "conversation_mismatch", "videos": [], "message_count": 0}
+            messages = [
+                message for message in all_messages
+                if isinstance(message, dict)
+                and message.get("conversation_id") in (None, "", "0", conversation_id)
+            ]
+            if not messages:
+                return {"state": "conversation_mismatch", "videos": [], "message_count": 0}
+
+        max_message_index = cls._max_video_message_index(messages)
+
+        videos = []
+        pending_count = 0
+        malformed_count = 0
+        for message in messages:
+            blocks = message.get("content_block", []) if isinstance(message, dict) else None
+            if not isinstance(blocks, list):
+                malformed_count += 1
+                continue
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("block_type") != 2074:
+                    continue
+                content = block.get("content", {})
+                creation_block = content.get("creation_block", {}) if isinstance(content, dict) else None
+                creations = creation_block.get("creations") if isinstance(creation_block, dict) else None
+                if not isinstance(creations, list):
+                    malformed_count += 1
+                    continue
+                for creation in creations:
+                    if not isinstance(creation, dict):
+                        malformed_count += 1
+                        continue
+                    if creation.get("type") not in (2, "2"):
+                        continue
+                    video = creation.get("video")
+                    if not isinstance(video, dict):
+                        malformed_count += 1
+                        continue
+                    status = cls._safe_video_number(video.get("status"), integer=True)
+                    if status != 3:
+                        pending_count += 1
+                        continue
+                    video_url = cls._video_url_from_item(video)
+                    if not cls._is_http_video_url(video_url):
+                        malformed_count += 1
+                        continue
+                    videos.append({
+                        "video_url": video_url,
+                        "cover_url": cls._video_cover_url(video),
+                        "width": cls._safe_video_number(video.get("width"), integer=True),
+                        "height": cls._safe_video_number(video.get("height"), integer=True),
+                        "duration": cls._safe_video_number(video.get("duration")),
+                    })
+        if videos:
+            return {
+                "state": "complete",
+                "videos": videos,
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+            }
+
+        decision_codes = []
+        has_clarification_gate = False
+        for message in messages:
+            ext = message.get("ext", {}) if isinstance(message, dict) else {}
+            if not isinstance(ext, dict):
+                continue
+            code = str(ext.get("ai_creation_res_code", ""))
+            if code:
+                decision_codes.append(code)
+            if (
+                str(ext.get("is_creation_clarifying", "")) == "1"
+                and code == "710082041"
+            ):
+                has_clarification_gate = True
+
+        error_codes = sorted({
+            code for code in decision_codes
+            if code not in ("0", "710082041", "<str>", "<redacted>")
+        })
+        if error_codes:
+            error = parse_upstream_error({"code": error_codes[0]})
+            return {
+                "state": "upstream_error",
+                "videos": [],
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+                "upstream_error": error,
+            }
+        # A resolved message (code 0) wins over a stale clarification message in
+        # the same history response, regardless of server message ordering.
+        if has_clarification_gate and "0" not in decision_codes:
+            return {
+                "state": "confirmation_required",
+                "videos": [],
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+            }
+        if malformed_count:
+            return {
+                "state": "malformed_result",
+                "videos": [],
+                "message_count": len(messages),
+                "max_message_index": max_message_index,
+            }
+        return {
+            "state": "pending",
+            "videos": [],
+            "message_count": len(messages),
+            "max_message_index": max_message_index,
+            "pending_creation_count": pending_count,
+        }
+
+    def _log_video_chain_diagnostic(self, result: Dict[str, Any]) -> None:
+        response = result.get("response", {})
+        chain = response.get("downlink_body", {}).get("pull_singe_chain_downlink_body", {}) if isinstance(response, dict) else {}
+        messages = chain.get("messages", []) if isinstance(chain, dict) else []
+        block_types = sorted({
+            block.get("block_type")
+            for message in messages if isinstance(message, dict)
+            for block in message.get("content_block", []) if isinstance(block, dict)
+            if isinstance(block.get("block_type"), int)
+        })
+        creation_statuses = []
+        business_codes = set()
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            ext = message.get("ext")
+            code = ext.get("ai_creation_res_code") if isinstance(ext, dict) else None
+            if isinstance(code, int) and not isinstance(code, bool):
+                business_codes.add(str(code))
+            elif isinstance(code, str) and re.fullmatch(r"\d{1,12}", code):
+                business_codes.add(code)
+            for block in message.get("content_block", []):
+                if not isinstance(block, dict) or block.get("block_type") != 2074:
+                    continue
+                creations = block.get("content", {}).get("creation_block", {}).get("creations", [])
+                for creation in creations if isinstance(creations, list) else []:
+                    video = creation.get("video", {}) if isinstance(creation, dict) else {}
+                    if isinstance(video, dict):
+                        status = video.get("status")
+                        if isinstance(status, (int, float)):
+                            creation_statuses.append(int(status))
+        conversation_id = result.get("conversation_id")
+        conversation_alias = (
+            hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()[:12]
+            if isinstance(conversation_id, str) and conversation_id
+            else "none"
+        )
+        log.log(
+            logging.INFO if result.get("state") in {"complete", "pending"} else logging.WARNING,
+            "generate_video phase=history_read category=%s status=%s message_count=%d "
+            "read_attempt=%s max_message_index=%s "
+            "block_types=%s creation_statuses=%s video_count=%d "
+            "conversation_alias=%s business_codes=%s",
+            result.get("state"),
+            result.get("http_status"),
+            len(messages),
+            result.get("read_attempt"),
+            result.get("max_message_index"),
+            block_types,
+            creation_statuses,
+            len(result.get("videos", [])),
+            conversation_alias,
+            sorted(business_codes),
+        )
+
+    @_serialized_browser_operation
+    async def _browser_json_post(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        """POST a JSON read request through the active page's fetch hook."""
+        if not self._ready or not self._page or self._page.is_closed():
+            raise RuntimeError("Browser not ready - need login first")
+
+        query_params = self._build_query_params()
+        for key in ("fp", "msToken", "tz_name"):
+            query_params.pop(key, None)
+        query = urlencode(dict(sorted(query_params.items())))
+        url = f"{path}?{query}"
+        request_id = f"read_{uuid.uuid4().hex}"
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        timeout_ms = int(timeout * 1000)
+        js_code = """
+        async ([url, payloadJson, timeoutMs, requestId]) => {
+            const controllers = window.__doubaoReadAbortControllers ||
+                (window.__doubaoReadAbortControllers = new Map());
+            const controller = new AbortController();
+            controllers.set(requestId, controller);
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            const csrf = document.cookie.match(/passport_csrf_token=([^;]+)/);
+            const headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'Content-Type': 'application/json; encoding=utf-8',
+                'agw-js-conv': 'str',
+            };
+            if (csrf) headers['x-tt-passport-csrf-token'] = csrf[1];
+            try {
+                const response = await fetch(url, {
+                    method: 'POST', headers, body: payloadJson,
+                    credentials: 'include', signal: controller.signal,
+                });
+                return {status: response.status, body: await response.text()};
+            } catch(error) {
+                return {error: error.name || 'FetchError'};
+            } finally {
+                clearTimeout(timer);
+                controllers.delete(requestId);
+            }
+        }
+        """
+        try:
+            result = await asyncio.wait_for(
+                self._page.evaluate(js_code, [url, payload_json, timeout_ms, request_id]),
+                timeout=timeout + 2,
+            )
+        except asyncio.CancelledError:
+            try:
+                if self._page and not self._page.is_closed():
+                    await asyncio.wait_for(
+                        self._page.evaluate(
+                            "id => window.__doubaoReadAbortControllers?.get(id)?.abort()",
+                            request_id,
+                        ),
+                        timeout=2,
+                    )
+            except Exception:
+                pass
+            raise
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Video result read timed out") from exc
+
+        if not isinstance(result, dict):
+            raise RuntimeError("Video result read returned malformed response")
+        status = result.get("status", 0)
+        body = result.get("body", "")
+        if result.get("error"):
+            error = parse_upstream_error({"error_type": "read_request_failed"})
+            self._log_video_diagnostic(
+                phase="history_read", events=[], attachments_count=0, task_count=0,
+                category=error.category, status=error.status_code, log_id=error.log_id,
+            )
+            raise UpstreamAPIError(error)
+        if not isinstance(status, int) or status < 200 or status >= 300:
+            error = parse_upstream_error(body, status_code=status)
+            self._log_video_diagnostic(
+                phase="history_read", events=[], attachments_count=0, task_count=0,
+                category=error.category, status=status if isinstance(status, int) else error.status_code,
+                log_id=error.log_id,
+            )
+            raise UpstreamAPIError(error)
+        try:
+            response_data = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            raise RuntimeError("Video result read returned malformed JSON") from None
+        if not isinstance(response_data, dict):
+            raise RuntimeError("Video result read returned malformed JSON")
+        return response_data
+
+    @_serialized_browser_operation
+    async def _read_video_creation_chain(
+        self, conversation_id: str, *, timeout: float = 30
+    ) -> Dict[str, Any]:
+        if not conversation_id:
+            raise RuntimeError("Video result read requires a conversation")
+        payload = {
+            "channel": 2,
+            "cmd": 3100,
+            "sequence_id": str(uuid.uuid4()),
+            "uplink_body": {
+                "pull_singe_chain_uplink_body": {
+                    "conversation_id": conversation_id,
+                    "anchor_index": 9007199254740991,
+                    "conversation_type": 3,
+                    "direction": 1,
+                    "limit": 20,
+                    "ext": {},
+                    "filter": {"index_list": []},
+                    "evaluate_ab_params": "",
+                    "evaluate_common_params": "",
+                    "option": {"lazy_load_strategy": 0},
+                },
+            },
+            "version": "1",
+        }
+        response = await self._browser_json_post("/im/chain/single", payload, timeout=timeout)
+        return response
+
+    @_serialized_browser_operation
+    async def _poll_video_creation_result(
+        self,
+        conversation_id: str,
+        *,
+        timeout: float = 600,
+        poll_interval: float = 5,
+        confirmation_sent: bool = False,
+        confirmation_callback: Optional[Callable[[int], Any]] = None,
+    ) -> Dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout
+        read_attempt = 0
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeError("Video generation failed (pending_timeout)")
+            response = await self._read_video_creation_chain(
+                conversation_id, timeout=min(30, max(1, remaining))
+            )
+            read_attempt += 1
+            result = self._parse_video_creation_chain(response, conversation_id=conversation_id)
+            result["response"] = response
+            result["http_status"] = 200
+            result["conversation_id"] = conversation_id
+            result["read_attempt"] = read_attempt
+            self._log_video_chain_diagnostic(result)
+            state = result.get("state")
+            if state == "complete":
+                return {"videos": result["videos"], "conversation_id": conversation_id}
+            if state == "confirmation_required":
+                if not confirmation_sent and confirmation_callback is not None:
+                    last_message_index = result.get("max_message_index")
+                    if (
+                        isinstance(last_message_index, bool)
+                        or not isinstance(last_message_index, int)
+                        or last_message_index <= 0
+                    ):
+                        raise RuntimeError("Video generation failed (confirmation_index_unavailable)")
+                    await confirmation_callback(last_message_index)
+                    confirmation_sent = True
+                    continue
+                if not confirmation_sent:
+                    raise RuntimeError("Video generation failed (confirmation_required)")
+                state = "pending"
+            if state == "conversation_mismatch":
+                raise RuntimeError("Video generation failed (conversation_mismatch)")
+            if state == "malformed_result":
+                raise RuntimeError("Video generation failed (malformed_result)")
+            if state == "malformed_response":
+                raise RuntimeError("Video generation failed (malformed_response)")
+            if state == "upstream_error":
+                raise UpstreamAPIError(result["upstream_error"])
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise RuntimeError("Video generation failed (pending_timeout)")
+            await asyncio.sleep(min(poll_interval, remaining))
+
+    def _log_video_diagnostic(
+        self,
+        *,
+        phase: str,
+        events: List[Dict[str, Any]],
+        attachments_count: int,
+        task_count: int,
+        category: str,
+        status: Optional[int] = None,
+        log_id: Optional[str] = None,
+        video_count: Optional[int] = None,
+    ) -> None:
+        event_types, content_types = self._video_response_metadata(events)
+        log.log(
+            logging.INFO if category in {"success", "task_submitted", "pending"} else logging.WARNING,
+            "generate_video phase=%s category=%s status=%s event_types=%s "
+            "content_types=%s async_task_count=%d attachments_count=%d "
+            "video_count=%s log_id=%s",
+            phase,
+            category,
+            status,
+            event_types,
+            content_types,
+            task_count,
+            attachments_count,
+            video_count,
+            log_id,
+        )
+
+    def _raise_video_quota(
+        self,
+        *,
+        phase: str,
+        events: List[Dict[str, Any]],
+        attachments_count: int,
+        task_count: int,
+        status: Optional[int] = None,
+        log_id: Optional[str] = None,
+    ) -> None:
+        manager = getattr(self, "account_manager", None)
+        account_id = getattr(manager, "active_account_id", None)
+        if manager is not None and account_id:
+            manager.mark_quota_exceeded(account_id=account_id, feature="video")
+        self._log_video_diagnostic(
+            phase=phase,
+            events=events,
+            attachments_count=attachments_count,
+            task_count=task_count,
+            category="video_quota",
+            status=status,
+            log_id=log_id,
+        )
+        raise VideoQuotaExceeded("Video generation quota exceeded for active account")
+
+    @classmethod
+    def _video_event_text(cls, event: Dict[str, Any]) -> str:
+        direct = cls._extract_text(event)
+        if direct:
+            return direct
+        if event.get("_event") not in {"FULL_MSG_NOTIFY", "STREAM_MSG_NOTIFY"}:
+            return ""
+        data = event.get("data", event)
+        message = data.get("message") if isinstance(data, dict) else None
+        if not isinstance(message, dict):
+            return ""
+        parts = []
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                text_block = node.get("text_block")
+                if isinstance(text_block, dict) and isinstance(text_block.get("text"), str):
+                    parts.append(text_block["text"])
+                for key in ("content", "content_block"):
+                    child = node.get(key)
+                    if isinstance(child, (dict, list)):
+                        visit(child)
+            elif isinstance(node, list):
+                for child in node:
+                    visit(child)
+
+        visit(message.get("content_block", []))
+        return "".join(parts)
+
+    @staticmethod
+    def _summarize_video_assistant_text(text: Any, *, fixture_prompt: str = "") -> Optional[Dict[str, str]]:
+        if not isinstance(text, str) or not text:
+            return None
+        if fixture_prompt:
+            text = text.replace(fixture_prompt, "<fixture-prompt>")
+        text = re.sub(r"https?://[^\s)\]]+", "<url>", text, flags=re.IGNORECASE)
+        text = re.sub(
+            r"(?i)(sessionid|msToken|x-bogus|a_bogus|authorization|cookie|signature|token)\s*[:=]\s*[^\s,;]+",
+            r"\1=<redacted>",
+            text,
+        )
+        text = re.sub(r"[A-Za-z0-9_-]{24,}", "<opaque>", text)
+        text = re.sub(r"\b\d{9,}\b", "<number>", text)[:2000]
+        if any(term in text for term in ("请确认", "确认后", "确认一下")):
+            category = "confirmation_requested"
+        elif any(term in text for term in ("请提供", "还需要", "请补充", "选择一个")):
+            category = "more_input_requested"
+        elif any(term in text for term in ("额度已用尽", "次数已达上限", "今日生成次数")):
+            category = "quota_or_limit"
+        elif any(term in text for term in ("生成好了", "生成完成", "视频已完成")):
+            category = "completion_claim"
+        elif any(term in text for term in ("无法生成", "不能生成", "生成失败")):
+            category = "refusal_or_error"
+        else:
+            category = "assistant_text"
+        return {"category": category, "excerpt": text}
+
+    @classmethod
+    def _summarize_video_assistant_event(
+        cls,
+        event_name: str,
+        event_data: Any,
+        *,
+        conversation_id: Optional[str],
+        fixture_prompt: str = "",
+    ) -> Optional[Dict[str, str]]:
+        if not isinstance(event_data, dict):
+            return None
+        if event_name == "STREAM_MSG_NOTIFY":
+            message = event_data.get("content")
+            metadata = event_data.get("meta")
+        elif event_name == "FULL_MSG_NOTIFY":
+            message = event_data.get("message")
+            metadata = message if isinstance(message, dict) else None
+        else:
+            return None
+        if not isinstance(message, dict):
+            return None
+        if isinstance(metadata, dict):
+            response_conversation_id = metadata.get("conversation_id")
+            if conversation_id and response_conversation_id and response_conversation_id != conversation_id:
+                return None
+            if metadata.get("user_type") == 1:
+                return None
+        blocks = message.get("content_block", [])
+        text_parts = []
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict) or block.get("block_type") != 10000:
+                continue
+            text_block = block.get("content", {}).get("text_block", {})
+            text = text_block.get("text") if isinstance(text_block, dict) else None
+            if isinstance(text, str) and text:
+                text_parts.append(text)
+        return cls._summarize_video_assistant_text("\n".join(text_parts), fixture_prompt=fixture_prompt)
+
+    def _raise_video_event_error(
+        self,
+        detail: Any,
+        *,
+        phase: str,
+        events: List[Dict[str, Any]],
+        attachments_count: int,
+        task_count: int,
+        status_code: Optional[int] = None,
+    ) -> None:
+        safe_error = parse_upstream_error(detail, status_code=status_code)
+        detail_text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+        if any(hint in detail_text for hint in _VIDEO_QUOTA_HINTS):
+            self._raise_video_quota(
+                phase=phase,
+                events=events,
+                attachments_count=attachments_count,
+                task_count=task_count,
+                status=safe_error.status_code or status_code,
+                log_id=safe_error.log_id,
+            )
+        self._log_video_diagnostic(
+            phase=phase,
+            events=events,
+            attachments_count=attachments_count,
+            task_count=task_count,
+            category=safe_error.category,
+            status=safe_error.status_code,
+            log_id=safe_error.log_id,
+        )
+        raise UpstreamAPIError(safe_error)
+
+    def _raise_video_request_error(
+        self, exc: Exception, *, phase: str, attachments_count: int
+    ) -> None:
+        message = str(exc)
+        status_match = re.search(r"failed \((\d{3})\)", message)
+        status = int(status_match.group(1)) if status_match else None
+        error_payload = message
+        if status_match:
+            body_start = message.find(": ", status_match.end())
+            if body_start >= 0:
+                error_payload = message[body_start + 2:]
+        safe_error = parse_upstream_error(error_payload, status_code=status)
+        self._log_video_diagnostic(
+            phase=phase,
+            events=[],
+            attachments_count=attachments_count,
+            task_count=0,
+            category=safe_error.category,
+            status=status or safe_error.status_code,
+            log_id=safe_error.log_id,
+        )
+        raise UpstreamAPIError(safe_error) from None
+
+    def _video_attachments_for_keys(
+        self,
+        keys: List[str],
+        supplied: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        if supplied is not None:
+            supplied_keys = [item.get("uri") for item in supplied if isinstance(item, dict)]
+            if supplied_keys != keys:
+                raise RuntimeError("Video reference image metadata does not match the requested images")
+
+        registry = getattr(self, "_uploaded_image_metadata", {})
+        manager = getattr(self, "account_manager", None)
+        active_account_id = getattr(manager, "active_account_id", None)
+        attachments = []
+        for uri in keys:
+            metadata = registry.get(uri) if isinstance(registry, dict) else None
+            if not isinstance(metadata, dict):
+                raise RuntimeError("Video reference image metadata is unavailable; upload the source image again")
+            owner_id = metadata.get("_account_id")
+            if active_account_id and owner_id != active_account_id:
+                raise RuntimeError("Video reference image belongs to another account")
+            if owner_id and not active_account_id:
+                raise RuntimeError("Video reference image account ownership is unavailable")
+
+            width = metadata.get("width")
+            height = metadata.get("height")
+            cdn_url = metadata.get("cdn_url")
+            name = metadata.get("name")
+            image_format = metadata.get("format")
+            if (
+                metadata.get("uri") != uri
+                or not self._is_http_video_url(cdn_url)
+                or not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(image_format, str)
+                or not image_format.strip()
+                or isinstance(width, bool)
+                or not isinstance(width, int)
+                or width <= 0
+                or isinstance(height, bool)
+                or not isinstance(height, int)
+                or height <= 0
+            ):
+                raise RuntimeError("Video reference image metadata is incomplete; upload the source image again")
+            attachments.append({
+                "uri": uri,
+                "cdn_url": cdn_url,
+                "name": name,
+                "format": image_format,
+                "width": width,
+                "height": height,
+            })
+        return attachments
+
+    async def _collect_video_chat_turn(
+        self,
+        text: str,
+        *,
+        phase: str,
+        conversation_id: Optional[str] = None,
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
+        chat_ability: Optional[Dict[str, Any]] = None,
+        separate_attachment_messages: bool = False,
+        memory_type: int,
+        attachments_count: int,
+        last_message_index: Optional[int] = None,
+    ) -> Optional[str]:
+        result_conversation_id = conversation_id
+        events: List[Dict[str, Any]] = []
+        quota_probe = ""
+        quota_probe_size = max(map(len, _VIDEO_QUOTA_HINTS))
+        turn_options: Dict[str, Any] = {
+            "conversation_id": conversation_id,
+            "memory_type": memory_type,
+            "include_conversation_init_ext": False,
+        }
+        if image_attachments is not None:
+            turn_options["image_attachments"] = image_attachments
+            turn_options["include_image_cdn_url"] = False
+        if chat_ability is not None:
+            turn_options["chat_ability"] = chat_ability
+        if separate_attachment_messages:
+            turn_options["separate_attachment_messages"] = True
+        if last_message_index is not None:
+            if (
+                isinstance(last_message_index, bool)
+                or not isinstance(last_message_index, int)
+                or last_message_index <= 0
+            ):
+                raise RuntimeError("Video generation failed (confirmation_index_unavailable)")
+            turn_options["last_message_index"] = last_message_index
+        async for event in self.chat_completion(text, **turn_options):
+            if not isinstance(event, dict):
+                continue
+            events.append(event)
+            event_text = self._video_event_text(event)
+            if event_text:
+                candidate_text = quota_probe + event_text
+                if any(hint in candidate_text for hint in _VIDEO_QUOTA_HINTS):
+                    self._raise_video_quota(
+                        phase=phase,
+                        events=events,
+                        attachments_count=attachments_count,
+                        task_count=0,
+                    )
+                quota_probe = candidate_text[-quota_probe_size:]
+            if event.get("error") or event.get("event_type") == 2005:
+                detail = event.get("body") or event.get("event_data") or event
+                self._raise_video_event_error(
+                    detail,
+                    phase=phase,
+                    events=events,
+                    attachments_count=attachments_count,
+                    task_count=0,
+                    status_code=event.get("status") if isinstance(event.get("status"), int) else None,
+                )
+            if not result_conversation_id:
+                candidate = self.extract_conversation_id(event)
+                if candidate and candidate != "0":
+                    result_conversation_id = candidate
+        self._log_video_diagnostic(
+            phase=phase,
+            events=events,
+            attachments_count=attachments_count,
+            task_count=0,
+            category="pending" if result_conversation_id else "no_conversation_id",
+        )
+        return result_conversation_id
+
     @_serialized_browser_operation
     async def generate_video(
         self,
@@ -2096,223 +3103,153 @@ class BrowserClient:
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
         ref_image_keys: Optional[List[str]] = None,
+        image_attachments: Optional[List[Dict[str, Any]]] = None,
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Generate video using /samantha/chat/completion (async 2-step).
-
-        Args:
-            prompt: Text description of the video to generate.
-            ratio: Aspect ratio ("16:9", "9:16", "1:1").
-            ref_image_key: Optional image key for image-to-video (single image).
-            ref_image_keys: Optional list of image keys for multi-image reference.
-            memory_type: Optional 0 (save to web history) or 2 (ephemeral).
-            save_history: If True, sets memory_type=0.
-
-        Returns:
-            Dict with 'videos' list, each having video_url/cover_url/duration.
-        """
-        import base64
-
-        content_data: Dict[str, Any] = {"text": prompt}
-        if ratio:
-            content_data["ratio"] = ratio
-
-        # Support both single and multiple reference images
-        keys = []
-        if ref_image_keys:
-            if isinstance(ref_image_keys, str):
-                keys.append(ref_image_keys)
-            elif isinstance(ref_image_keys, (list, tuple)):
-                keys.extend([k for k in ref_image_keys if k])
+        """Create a Seedance video through the captured chat-completion flow."""
+        keys: List[str] = []
+        if isinstance(ref_image_keys, str):
+            keys.extend([ref_image_keys] if ref_image_keys else [])
+        elif isinstance(ref_image_keys, (list, tuple)):
+            keys.extend(key for key in ref_image_keys if isinstance(key, str) and key)
         if ref_image_key and ref_image_key not in keys:
             keys.insert(0, ref_image_key)
+        keys = list(dict.fromkeys(keys))
+        attachments = self._video_attachments_for_keys(keys, image_attachments)
 
-        attachments = [{"type": "image", "key": k} for k in keys]
-
-        message: Dict[str, Any] = {
-            "content": json.dumps(content_data, ensure_ascii=False),
-            "content_type": 2020,
-            "attachments": attachments,
-            "references": [],
-            "skill": {
-                "skill_type": 17,
-                "skill_type_no_default": 17,
-                "skill_id": "17",
-                "skill_id_no_default": "17",
-            },
+        allowed_ratios = {"auto", "1:1", "16:9", "9:16", "4:3", "3:4"}
+        selected_ratio = str(ratio).strip() if ratio is not None else "auto"
+        if selected_ratio not in allowed_ratios:
+            selected_ratio = "auto"
+        effective_memory_type = resolve_memory_type(memory_type, save_history)
+        ability = {
+            "ability_type": 17,
+            "ability_param": json.dumps({
+                "ratio": selected_ratio,
+                "model": "seedance_v2.0_mini",
+                "duration": 10,
+                "input_box_content": {
+                    "user_input_content": prompt,
+                    "reply_message_format": "生成视频：%s",
+                },
+            }, ensure_ascii=False),
         }
 
-        eff_mem_type = resolve_memory_type(memory_type, save_history)
-        payload = {
-            "messages": [message],
-            "completion_option": {
-                "is_regen": False,
-                "with_suggest": True,
-                "need_create_conversation": True,
-                "launch_stage": 1,
-                "is_replace": False,
-                "is_delete": False,
-                "is_ai_playground": False,
-                "memory_type": eff_mem_type,
-                "message_from": 0,
-                "use_deep_think": False,
-                "use_auto_cot": False,
-                "resend_for_regen": False,
-                "enable_commerce_credit": False,
-                "action_bar_skill_id": 17,
-            },
-            "evaluate_option": {"web_ab_params": ""},
-            "local_conversation_id": str(uuid.uuid4()),
-            "local_message_id": str(uuid.uuid4()),
-        }
+        conversation_id = await self._collect_video_chat_turn(
+            prompt,
+            phase="submit",
+            image_attachments=attachments,
+            chat_ability=ability,
+            separate_attachment_messages=True,
+            memory_type=effective_memory_type,
+            attachments_count=len(attachments),
+        )
+        if not conversation_id:
+            raise RuntimeError("Video generation failed (no_conversation_id)")
 
-        log.info("generate_video: prompt=%s, ratio=%s, memory_type=%s, attachments_count=%d", prompt[:50], ratio, eff_mem_type, len(attachments))
-        raw = await self._samantha_request(payload, timeout=60)
+        initial = await self._read_video_creation_chain(conversation_id)
+        result = self._parse_video_creation_chain(initial, conversation_id=conversation_id)
+        confirmation_sent = False
 
-        # Phase 1: Extract async task_id from fin_reason
-        task_id = None
-        text_parts = []
-        for data in self._parse_samantha_sse(raw):
-            et = data.get("event_type")
-            if et == 2005:
-                detail = data.get("event_data", "")
-                is_quota = any(k in str(detail) for k in ("今日生成次数已达上限", "次数已达上限", "额度已用尽", "达到今日上限", "次数超限"))
-                if is_quota and hasattr(self, "account_manager"):
-                    self.account_manager.mark_quota_exceeded(
-                        account_id=self.account_manager.active_account_id,
-                        feature="video",
-                    )
-                    raise VideoQuotaExceeded("Video generation quota exceeded for active account")
-                raise RuntimeError(f"generate_video error: {str(detail)[:500]}")
-            if et != 2001:
-                continue
-
-            ed = data.get("event_data", {})
-            if isinstance(ed, str):
-                try:
-                    ed = json.loads(ed)
-                except json.JSONDecodeError:
-                    continue
-
-            # Check for async task
-            fin_reason = ed.get("fin_reason", {})
-            if fin_reason and fin_reason.get("reason") == 1:
-                async_task = fin_reason.get("async_task", {})
-                task_id = async_task.get("id", "")
-
-            # Collect text for error messages
-            msg = ed.get("message", {})
-            if isinstance(msg, str):
-                try:
-                    msg = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
-            if msg.get("content_type") == 2001:
-                content_raw = msg.get("content", "")
-                if isinstance(content_raw, str):
-                    try:
-                        c = json.loads(content_raw)
-                        text_parts.append(c.get("text", ""))
-                    except json.JSONDecodeError:
-                        pass
-
-        full_text = "".join(text_parts)
-        is_quota = any(k in full_text for k in ("今日生成次数已达上限", "次数已达上限", "额度已用尽", "达到今日上限", "次数超限"))
-        if is_quota and hasattr(self, "account_manager"):
-            self.account_manager.mark_quota_exceeded(
-                account_id=self.account_manager.active_account_id,
-                feature="video",
+        async def _send_confirmation(last_message_index: int) -> None:
+            confirmed_conversation_id = await self._collect_video_chat_turn(
+                "确认，按上述参数开始生成视频。",
+                phase="confirmation",
+                conversation_id=conversation_id,
+                memory_type=effective_memory_type,
+                attachments_count=len(attachments),
+                last_message_index=last_message_index,
             )
-            raise VideoQuotaExceeded("Video generation quota exceeded for active account")
+            if confirmed_conversation_id != conversation_id:
+                raise RuntimeError("Video generation failed (conversation_mismatch)")
 
-        if "服务过载" in full_text or "重试" in full_text:
-            raise RuntimeError("视频生成服务过载，请稍后重试")
+        if result["state"] == "confirmation_required":
+            last_message_index = result.get("max_message_index")
+            if (
+                isinstance(last_message_index, bool)
+                or not isinstance(last_message_index, int)
+                or last_message_index <= 0
+            ):
+                raise RuntimeError("Video generation failed (confirmation_index_unavailable)")
+            await _send_confirmation(last_message_index)
+            confirmation_sent = True
+        elif result["state"] == "complete":
+            self._log_video_chain_diagnostic({
+                **result,
+                "response": initial,
+                "http_status": 200,
+                "conversation_id": conversation_id,
+                "read_attempt": 0,
+            })
+            return {
+                "videos": result["videos"],
+                "prompt": prompt,
+                "conversation_id": conversation_id,
+            }
+        elif result["state"] == "upstream_error":
+            raise UpstreamAPIError(result["upstream_error"])
+        elif result["state"] == "conversation_mismatch":
+            raise RuntimeError("Video generation failed (conversation_mismatch)")
+        elif result["state"] == "malformed_result":
+            raise RuntimeError("Video generation failed (malformed_result)")
+        elif result["state"] == "malformed_response":
+            raise RuntimeError("Video generation failed (malformed_response)")
 
-        if not task_id:
-            # Maybe sync result with content_type=2021, or just text response
-            if full_text:
-                return {"videos": [], "prompt": prompt, "message": full_text}
-            raise RuntimeError("Video generation: no task_id returned")
-
-        # Phase 2: Poll for result
-        log.info("generate_video: polling task_id=%s", task_id)
-        return await self._poll_video_result(task_id, prompt)
+        generated = await self._poll_video_creation_result(
+            conversation_id,
+            timeout=600,
+            confirmation_sent=confirmation_sent,
+            confirmation_callback=None if confirmation_sent else _send_confirmation,
+        )
+        return {
+            "videos": generated["videos"],
+            "prompt": prompt,
+            "conversation_id": conversation_id,
+        }
 
     @_serialized_browser_operation
     async def _poll_video_result(
-        self, task_id: str, prompt: str, timeout: float = 300
+        self,
+        task_id: str,
+        prompt: str,
+        timeout: float = 300,
+        attachments_count: int = 0,
     ) -> Dict[str, Any]:
         """Poll /samantha/chat/completion with task_id for video result."""
-        import base64
-
         poll_payload = {"task_id": task_id, "event_id": 0}
         # Use _samantha_request which now uses browser fetch
-        raw = await self._samantha_request(poll_payload, timeout=timeout)
+        try:
+            raw = await self._samantha_request(poll_payload, timeout=timeout)
+        except Exception as exc:
+            self._raise_video_request_error(
+                exc, phase="poll", attachments_count=attachments_count
+            )
 
-        videos = []
-        for data in self._parse_samantha_sse(raw):
-            et = data.get("event_type")
-            if et != 2001:
-                continue
-
-            ed = data.get("event_data", {})
-            if isinstance(ed, str):
-                try:
-                    ed = json.loads(ed)
-                except json.JSONDecodeError:
-                    continue
-
-            msg = ed.get("message", {})
-            if isinstance(msg, str):
-                try:
-                    msg = json.loads(msg)
-                except json.JSONDecodeError:
-                    continue
-
-            if msg.get("content_type") != 2021:
-                continue
-
-            content_raw = msg.get("content", "")
-            if isinstance(content_raw, str):
-                try:
-                    content = json.loads(content_raw)
-                except json.JSONDecodeError:
-                    continue
-            else:
-                content = content_raw
-
-            for item in content.get("data", [content]):
-                if not isinstance(item, dict):
-                    continue
-                video_url = item.get("video_url", "") or item.get("url", "")
-                if not video_url:
-                    vm_str = item.get("video_model", "")
-                    if vm_str:
-                        try:
-                            vm = json.loads(vm_str) if isinstance(vm_str, str) else vm_str
-                            vlist = vm.get("video_list", {})
-                            for _q, vinfo in vlist.items():
-                                main_b64 = vinfo.get("main_url", "")
-                                if main_b64:
-                                    video_url = base64.b64decode(main_b64).decode(
-                                        "utf-8", errors="replace"
-                                    )
-                                    break
-                        except (json.JSONDecodeError, Exception):
-                            pass
-
-                cover_url = item.get("cover_url", "") or item.get("cover", {}).get("url", "")
-                if video_url:
-                    videos.append({
-                        "video_url": video_url,
-                        "cover_url": cover_url,
-                        "width": item.get("width", 0),
-                        "height": item.get("height", 0),
-                        "duration": item.get("duration", 0.0),
-                    })
-
-        log.info("generate_video: got %d videos", len(videos))
+        events = self._parse_samantha_sse(raw)
+        for data in events:
+            if isinstance(data, dict) and data.get("event_type") == 2005:
+                self._raise_video_event_error(
+                    data.get("event_data", ""),
+                    phase="poll",
+                    events=events,
+                    attachments_count=attachments_count,
+                    task_count=1,
+                )
+        videos, malformed_count = self._extract_video_results(events)
+        category = "success" if videos else (
+            "malformed_result" if malformed_count else "no_video_result"
+        )
+        self._log_video_diagnostic(
+            phase="poll",
+            events=events,
+            attachments_count=attachments_count,
+            task_count=1,
+            category=category,
+            video_count=len(videos),
+        )
+        if not videos:
+            raise RuntimeError(f"Video generation failed ({category})")
         return {"videos": videos, "prompt": prompt}
 
     # ------------------------------------------------------------------
@@ -2568,7 +3505,7 @@ class BrowserClient:
         except Exception:
             pass
 
-        return {
+        result = {
             "uri": info.get("uri", uri),
             "cdn_url": info.get("main_url") or info.get("url", ""),
             "name": filename,
@@ -2576,6 +3513,11 @@ class BrowserClient:
             "width": int(info.get("width") or img_w),
             "height": int(info.get("height") or img_h),
         }
+        metadata = dict(result)
+        manager = getattr(self, "account_manager", None)
+        metadata["_account_id"] = getattr(manager, "active_account_id", None)
+        self._uploaded_image_metadata[result["uri"]] = metadata
+        return result
 
     @_serialized_browser_operation
     async def chat_with_file(
